@@ -68,106 +68,136 @@ public sealed class ProviderFixture : IDisposable
         }
     }
 
+    // The stub's handlers, keyed by "METHOD /path" ("* /path" for any method). A table lookup picks the
+    // handler, so no handler is guarded by comparing the request's path or method string (CodeQL
+    // cs/user-controlled-bypass).
+    Dictionary<string, Action<HttpListenerContext, string>>? routes;
+
+    Dictionary<string, Action<HttpListenerContext, string>> Routes() => routes ??= new()
+    {
+        ["* /.well-known/openid-configuration"] = Discovery,
+        ["* /jwks"] = Jwks,
+        ["* /userinfo"] = UserInfo,
+        ["POST /par"] = Par,
+        ["* /authorize"] = Authorize,
+        ["POST /token"] = Token,
+    };
+
     void Handle(HttpListenerContext exchange)
     {
         using var reader = new StreamReader(exchange.Request.InputStream, exchange.Request.ContentEncoding);
         var text = reader.ReadToEnd();
         var path = exchange.Request.Url!.AbsolutePath;
-        if (path == "/.well-known/openid-configuration") { Json(exchange, 200, Metadata()); return; }
-        if (path == "/jwks") { Json(exchange, 200, new Dictionary<string, object?> { ["keys"] = new List<object?> { ProviderJwk } }); return; }
-        if (path == "/userinfo")
+        var table = Routes();
+        var handler = table.GetValueOrDefault(exchange.Request.HttpMethod + " " + path) ?? table.GetValueOrDefault("* " + path) ?? NotFound;
+        handler(exchange, text);
+    }
+
+    void NotFound(HttpListenerContext exchange, string text)
+    {
+        Json(exchange, 404, new Dictionary<string, object?> { ["error"] = "not_found" });
+    }
+
+    void Discovery(HttpListenerContext exchange, string text)
+    {
+        Json(exchange, 200, Metadata());
+    }
+
+    void Jwks(HttpListenerContext exchange, string text)
+    {
+        Json(exchange, 200, new Dictionary<string, object?> { ["keys"] = new List<object?> { ProviderJwk } });
+    }
+
+    void UserInfo(HttpListenerContext exchange, string text)
+    {
+        var header = exchange.Request.Headers["Authorization"] ?? "";
+        var token = header.StartsWith("Bearer ", StringComparison.Ordinal) ? header[7..].Trim() : "";
+        State.Access.TryGetValue(token, out var claims);
+        Json(exchange, claims == null ? 401 : 200, claims ?? new Dictionary<string, object?> { ["error"] = "invalid_token" });
+    }
+
+    void Par(HttpListenerContext exchange, string text)
+    {
+        if (!Authorized(exchange, text)) { Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "invalid_client" }); return; }
+        var requestUri = "urn:par:" + Guid.NewGuid().ToString("N");
+        State.Pushed[requestUri] = Form(text);
+        Json(exchange, 201, new Dictionary<string, object?> { ["request_uri"] = requestUri, ["expires_in"] = 60 });
+    }
+
+    void Authorize(HttpListenerContext exchange, string text)
+    {
+        var query = Form(exchange.Request.Url!.Query.TrimStart('?'));
+        var stored = query.GetValueOrDefault("request_uri");
+        var parameters = stored == null ? query : State.Pushed.GetValueOrDefault(stored);
+        if (parameters == null) { Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_request" }); return; }
+        var redirect = parameters.GetValueOrDefault("redirect_uri") ?? "";
+        var state = parameters.GetValueOrDefault("state") ?? "";
+        var challenge = parameters.GetValueOrDefault("code_challenge") ?? "";
+        if (parameters.GetValueOrDefault("code_challenge_method") != "S256" || challenge.Length == 0)
         {
-            var header = exchange.Request.Headers["Authorization"] ?? "";
-            var token = header.StartsWith("Bearer ", StringComparison.Ordinal) ? header[7..].Trim() : "";
-            State.Access.TryGetValue(token, out var claims);
-            Json(exchange, claims == null ? 401 : 200, claims ?? new Dictionary<string, object?> { ["error"] = "invalid_token" });
+            Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_request" });
             return;
         }
-        if (path == "/par" && exchange.Request.HttpMethod == "POST")
+        var row = new Dictionary<string, string>
         {
-            if (!Authorized(exchange, text)) { Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "invalid_client" }); return; }
-            var requestUri = "urn:par:" + Guid.NewGuid().ToString("N");
-            State.Pushed[requestUri] = Form(text);
-            Json(exchange, 201, new Dictionary<string, object?> { ["request_uri"] = requestUri, ["expires_in"] = 60 });
+            ["sub"] = "user-1", ["email"] = "user-1@example.com", ["sid"] = "sid-1",
+            ["nonce"] = parameters.GetValueOrDefault("nonce") ?? "", ["redirect"] = redirect, ["challenge"] = challenge,
+        };
+        var code = Guid.NewGuid().ToString("N");
+        State.Codes[code] = row;
+        var back = new Uri(redirect);
+        var location = back.GetComponents(UriComponents.SchemeAndServer, UriFormat.SafeUnescaped)
+            + (string.IsNullOrEmpty(back.AbsolutePath) ? "/" : back.AbsolutePath)
+            + "?code=" + Uri.EscapeDataString(code) + "&state=" + Uri.EscapeDataString(state) + "&iss=" + Uri.EscapeDataString(State.Url);
+        exchange.Response.StatusCode = 302;
+        exchange.Response.Headers["Location"] = location;
+        exchange.Response.ContentLength64 = 0;
+        exchange.Response.Close();
+    }
+
+    void Token(HttpListenerContext exchange, string text)
+    {
+        if (!Authorized(exchange, text))
+        {
+            Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "invalid_client", ["error_description"] = "client authentication failed" });
             return;
         }
-        if (path == "/authorize")
+        var parameters = Form(text);
+        var grant = parameters.GetValueOrDefault("grant_type") ?? "";
+        if (grant == "client_credentials")
         {
-            var query = Form(exchange.Request.Url.Query.TrimStart('?'));
-            var stored = query.GetValueOrDefault("request_uri");
-            var parameters = stored == null ? query : State.Pushed.GetValueOrDefault(stored);
-            if (parameters == null) { Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_request" }); return; }
-            var redirect = parameters.GetValueOrDefault("redirect_uri") ?? "";
-            var state = parameters.GetValueOrDefault("state") ?? "";
-            var challenge = parameters.GetValueOrDefault("code_challenge") ?? "";
-            if (parameters.GetValueOrDefault("code_challenge_method") != "S256" || challenge.Length == 0)
-            {
-                Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_request" });
-                return;
-            }
-            var row = new Dictionary<string, string>
-            {
-                ["sub"] = "user-1", ["email"] = "user-1@example.com", ["sid"] = "sid-1",
-                ["nonce"] = parameters.GetValueOrDefault("nonce") ?? "", ["redirect"] = redirect, ["challenge"] = challenge,
-            };
-            var code = Guid.NewGuid().ToString("N");
-            State.Codes[code] = row;
-            var back = new Uri(redirect);
-            var location = back.GetComponents(UriComponents.SchemeAndServer, UriFormat.SafeUnescaped)
-                + (string.IsNullOrEmpty(back.AbsolutePath) ? "/" : back.AbsolutePath)
-                + "?code=" + Uri.EscapeDataString(code) + "&state=" + Uri.EscapeDataString(state) + "&iss=" + Uri.EscapeDataString(State.Url);
-            exchange.Response.StatusCode = 302;
-            exchange.Response.Headers["Location"] = location;
-            exchange.Response.ContentLength64 = 0;
-            exchange.Response.Close();
+            Json(exchange, 200, new Dictionary<string, object?> { ["access_token"] = "cc-token", ["token_type"] = "Bearer", ["expires_in"] = 120, ["scope"] = parameters.GetValueOrDefault("scope") ?? "" });
             return;
         }
-        if (path == "/token" && exchange.Request.HttpMethod == "POST")
+        if (grant == "refresh_token")
         {
-            if (!Authorized(exchange, text))
-            {
-                Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "invalid_client", ["error_description"] = "client authentication failed" });
-                return;
-            }
-            var parameters = Form(text);
-            var grant = parameters.GetValueOrDefault("grant_type") ?? "";
-            if (grant == "client_credentials")
-            {
-                Json(exchange, 200, new Dictionary<string, object?> { ["access_token"] = "cc-token", ["token_type"] = "Bearer", ["expires_in"] = 120, ["scope"] = parameters.GetValueOrDefault("scope") ?? "" });
-                return;
-            }
-            if (grant == "refresh_token")
-            {
-                if (!State.Refresh.TryGetValue(parameters.GetValueOrDefault("refresh_token") ?? "", out var row))
-                {
-                    Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_grant" });
-                    return;
-                }
-                var minted = TokenFor(row!);
-                var claims = new Dictionary<string, object?>(State.Access[(string)minted["access_token"]!]);
-                claims.Remove("nonce");
-                minted["id_token"] = IdTokenOf(claims, false);
-                Json(exchange, 200, minted);
-                return;
-            }
-            var code = parameters.GetValueOrDefault("code") ?? "";
-            if (!State.Codes.TryGetValue(code, out var saved) || saved["redirect"] != parameters.GetValueOrDefault("redirect_uri"))
+            if (!State.Refresh.TryGetValue(parameters.GetValueOrDefault("refresh_token") ?? "", out var row))
             {
                 Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_grant" });
                 return;
             }
-            var verifier = parameters.GetValueOrDefault("code_verifier") ?? "";
-            var got = Codec.B64UrlEncode(SHA256.HashData(Encoding.UTF8.GetBytes(verifier)));
-            if (got != saved["challenge"])
-            {
-                Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_grant", ["error_description"] = "pkce" });
-                return;
-            }
-            State.Codes.Remove(code);
-            Json(exchange, 200, TokenFor(saved));
+            var minted = TokenFor(row!);
+            var claims = new Dictionary<string, object?>(State.Access[(string)minted["access_token"]!]);
+            claims.Remove("nonce");
+            minted["id_token"] = IdTokenOf(claims, false);
+            Json(exchange, 200, minted);
             return;
         }
-        Json(exchange, 404, new Dictionary<string, object?> { ["error"] = "not_found" });
+        var code = parameters.GetValueOrDefault("code") ?? "";
+        if (!State.Codes.TryGetValue(code, out var saved) || saved["redirect"] != parameters.GetValueOrDefault("redirect_uri"))
+        {
+            Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_grant" });
+            return;
+        }
+        var verifier = parameters.GetValueOrDefault("code_verifier") ?? "";
+        var got = Codec.B64UrlEncode(SHA256.HashData(Encoding.UTF8.GetBytes(verifier)));
+        if (got != saved["challenge"])
+        {
+            Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_grant", ["error_description"] = "pkce" });
+            return;
+        }
+        State.Codes.Remove(code);
+        Json(exchange, 200, TokenFor(saved));
     }
 
     Dictionary<string, object?> Metadata()
