@@ -4,23 +4,38 @@
 """Sign this demo in to a fresh iya-sts and confirm two Shared Signals events.
 
 Starts the latest main branch of iya-sts in memory mode, with persistence and
-clustering off and no request workers, unless IYA_STS_URL is already set.
-Registers the demo with the host's python3, signs in through it, emits a
+clustering off and no request workers, unless IYA_STS_URL is already set
+(IYA_STS_IMAGE starts a fresh container from that image instead of cloning and
+building main). Registers the demo, signs in through it, emits a
 credential-change and a session-revoked event, and requires the demo's
 /live-status to show both. The second one also ends the local session.
 
 The unit suite stays `docker build --target test`. This file is the live half.
-It uses the host's Python and Docker. The demo runs in a container. Configuring
-the client is `python3 scripts/configure_iya_sts.py` on the host, not in a
-container. It does not import this library and does not run dotnet. Do not bind
-port 3000, 8081, or 18481 through 18495.
+It uses only the host's Python standard library and Docker; .NET never runs on
+the host. The order is the one a person follows, in a copy of the repository
+(the checkout is never written):
 
-IYA_STS_URL, when set, uses an iya-sts that is already running and does not
-stop it. This script never removes iya-sts-live-main, iya-sts-live-probe, or a
-container whose name starts with sts. Otherwise it clones main (or builds
-IYA_STS_SRC) and removes only the container it started. The demo container it
-removes is oidc-caep-risc-csharp-live-demo. It never runs docker compose up, and
-it never uses --network host for iya-sts.
+1. the install script, `scripts/configure_iya_sts.py` (standard-library Python
+   on the host), registers the demo, writes its client secret to
+   demo/generated/client-secret (mode 0600) and writes iya-sts's listener CA
+   trust chain to the file demo/oidc.json's `tlsCa` names,
+   demo/generated/idp-ca.pem;
+2. the demo image is built, and carries that chain from build time (never the
+   client secret: .dockerignore admits only the chain from demo/generated);
+3. the demo image runs with only the client secret mounted, and with the
+   start-time refresh off (TLS_CA_REFRESH=0), so the demo trusts iya-sts
+   through the chain the image was built with.
+
+This script does not fetch the CA for the demo, rewrite tlsCa, or mount a CA
+over it. It reads the saved chain for its own HTTPS client, and checks that the
+image holds the same file and no client secret.
+
+Do not bind port 3000, 8081, or 18481 to 18495. This script never removes
+iya-sts-live-main, iya-sts-live-probe, or a container whose name starts with
+sts. It removes only the containers it started,
+iya-sts-live-oidc-caep-risc-csharp and oidc-caep-risc-csharp-live-demo, and
+the image it built, oidc-caep-risc-csharp-live:demo. It never runs docker
+compose up, and it never uses --network host for iya-sts.
 """
 
 import base64
@@ -213,20 +228,56 @@ def wait_port(port, timeout):
     raise RuntimeError(f"127.0.0.1:{port} did not accept a connection")
 
 
-def fetch_ca(origin, dest):
+def wait_ready(origin, secret, timeout):
+    """Wait until iya-sts mints an /admin-api token. Verification is off here: this only asks whether
+    the listener is up. Nothing it receives is kept, and the demo's trust comes from the install script."""
     parts = urllib.parse.urlsplit(origin)
-    context = ssl._create_unverified_context()
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=30)
-    try:
-        conn.request("GET", "/tls/server-certificate")
-        response = conn.getresponse()
-        body = response.read()
-    finally:
-        conn.close()
-    if response.status != 200 or b"BEGIN CERTIFICATE" not in body:
-        raise RuntimeError(f"GET /tls/server-certificate answered {response.status}")
-    dest.write_bytes(body)
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "scope": "admin:read admin:write",
+        "resource": origin + "/admin-api",
+    }).encode()
+    basic = base64.b64encode(f"sts-api-client:{secret}".encode()).decode()
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            tls = ssl._create_unverified_context()
+            tls.minimum_version = ssl.TLSVersion.TLSv1_2
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443,
+                                               context=tls, timeout=10)
+            conn.request("POST", "/oauth2/token", body=body, headers={
+                "content-type": "application/x-www-form-urlencoded",
+                "authorization": f"Basic {basic}",
+            })
+            response = conn.getresponse()
+            response.read()
+            conn.close()
+            if response.status == 200:
+                return
+            last = f"the token endpoint answered {response.status}"
+        except OSError as err:
+            last = str(err)
+        time.sleep(2)
+    raise RuntimeError(f"iya-sts at {origin} did not become ready: {last}")
+
+
+def copy_context(dest):
+    """A copy of the repository's tracked and untracked-but-not-ignored files: the build context and
+    the demo directory the install script writes into. The checkout itself is never written."""
+    listed = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-co", "--exclude-standard", "-z"],
+        check=True, capture_output=True,
+    ).stdout.decode("utf-8").split("\0")
+    for name in listed:
+        if not name or name.startswith("demo/generated/"):
+            continue
+        source = ROOT / name
+        if not source.is_file():
+            continue
+        target = dest / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
 
 def rewrite_config(source, dest, sts_origin, demo_origin):
@@ -548,12 +599,14 @@ def prepare_sts(sts_port, secret):
     return f"https://127.0.0.1:{sts_port}", name
 
 
-def configure_demo(config, sts_origin, demo_origin, username, password, secret):
+def configure_demo(config, sts_origin, demo_origin, demo_port, username, password, secret):
+    """Register the demo with the host's python3. The script uses only the standard library."""
     env = os.environ.copy()
     env["ADMIN_API_CLIENT_SECRET"] = secret
     env["STS_ADMIN_API_CLIENT_SECRET"] = secret
     env[PROFILE["password_env"]] = password
     env["PUBLIC_URL"] = demo_origin
+    env["PORT"] = str(demo_port)
     completed = run(
         [
             *PROFILE["configure"],
@@ -572,6 +625,15 @@ def configure_demo(config, sts_origin, demo_origin, username, password, secret):
         print(completed.stderr, file=sys.stderr, flush=True)
 
 
+def image_file(image, path):
+    """The bytes of one file in the image, or None when it is not there."""
+    found = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "cat", image, path],
+        check=False, capture_output=True,
+    )
+    return found.stdout if found.returncode == 0 else None
+
+
 def main():
     sts_port = int(os.environ.get("LIVE_STS_PORT") or 18524)
     demo_port = int(os.environ.get("LIVE_DEMO_PORT") or 18624)
@@ -588,31 +650,43 @@ def main():
     image = PROFILE["repo"] + "-live:demo"
     work = Path(tempfile.mkdtemp(prefix=PROFILE["repo"] + "-live-"))
     try:
-        wait_port(urllib.parse.urlsplit(sts_origin).port or 443, 120)
-        ca_file = work / "idp-ca.pem"
-        deadline = time.time() + 90
-        last_error = None
-        while time.time() < deadline:
-            try:
-                fetch_ca(sts_origin, ca_file)
-                last_error = None
-                break
-            except Exception as err:
-                last_error = err
-                time.sleep(2)
-        if last_error:
-            raise last_error
-        config = work / "oidc.json"
+        context = work / "context"
+        copy_context(context)
+        demo_dir = context / "demo"
+        config = demo_dir / "oidc.json"
         rewrite_config(ROOT / PROFILE["config_file"], config, sts_origin, demo_origin)
-        configure_demo(config, sts_origin, demo_origin, username, password, secret)
-        docker("build", "-t", image, str(ROOT))
+        raw = json.loads(config.read_text(encoding="utf-8"))
+        if not str(raw.get("tlsCa") or "").startswith("generated/"):
+            raise RuntimeError(f"{PROFILE['config_file']} tlsCa must name a file under demo/generated")
+        if not str(raw.get("clientSecret") or "").startswith("file:generated/"):
+            raise RuntimeError(f"{PROFILE['config_file']} clientSecret must name a file under demo/generated")
+        tls_ca = demo_dir / raw["tlsCa"]
+        secret_rel = raw["clientSecret"][len("file:"):]
+        client_secret = demo_dir / secret_rel
+        wait_port(urllib.parse.urlsplit(sts_origin).port or 443, 120)
+        wait_ready(sts_origin, secret, 180)
+        # 1. The install script registers the demo, writes the client secret, and writes the chain
+        #    to the tlsCa file.
+        configure_demo(config, sts_origin, demo_origin, demo_port, username, password, secret)
+        if not tls_ca.is_file() or "BEGIN CERTIFICATE" not in tls_ca.read_text(encoding="utf-8"):
+            raise RuntimeError(f"the install script did not write the trust chain to {raw['tlsCa']}")
+        if not client_secret.is_file():
+            raise RuntimeError(f"the install script did not write the client secret to {secret_rel}")
+        # 2. The demo image carries that chain from build time, and not the client secret.
+        docker("build", "-t", image, str(context))
+        if image_file(image, "/app/demo/" + raw["tlsCa"]) != tls_ca.read_bytes():
+            raise RuntimeError(f"the demo image does not carry the saved trust chain at /app/demo/{raw['tlsCa']}")
+        if image_file(image, "/app/demo/" + secret_rel) is not None:
+            raise RuntimeError(f"the demo image holds the client secret at /app/demo/{secret_rel}")
+        print(f"the demo image carries the trust chain at /app/demo/{raw['tlsCa']} and no client secret", flush=True)
+        # 3. The demo runs with only the client secret mounted, and no refresh at start.
         docker_rm(demo_name)
         docker(
             "run", "-d", "--name", demo_name, "--network", "host",
-            "-v", f"{work}:/work",
+            "-v", f"{client_secret}:/app/demo/{secret_rel}:ro",
             "-e", f"PORT={demo_port}",
             "-e", f"PUBLIC_URL={demo_origin}",
-            "-e", "OIDC_CONFIG=/work/oidc.json",
+            "-e", "TLS_CA_REFRESH=0",
             image,
         )
         deadline = time.time() + 90
@@ -637,7 +711,7 @@ def main():
             if logs.stderr:
                 print(logs.stderr, file=sys.stderr, flush=True)
             raise RuntimeError("the demo /healthz did not answer ok")
-        client = Client(ca_file)
+        client = Client(tls_ca)
         driver = Driver(client, sts_origin, demo_origin, username, password)
         driver.sign_in()
         signed_in = wait_for(
@@ -664,11 +738,19 @@ def main():
             ),
             "session-revoked to end the local session",
         )
-        print(json.dumps({"ok": True, "subject": signed_in.get("subject"), "events": finished.get("events")}, indent=2))
+        print(json.dumps({
+            "ok": True,
+            "subject": signed_in.get("subject"),
+            "tlsCaInImage": True,
+            "clientSecretInImage": False,
+            "events": finished.get("events"),
+        }, indent=2))
     finally:
         docker_rm(demo_name)
         if sts_name:
             docker_rm(sts_name)
+        subprocess.run(["docker", "rmi", "-f", image], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         shutil.rmtree(work, ignore_errors=True)
 
 
