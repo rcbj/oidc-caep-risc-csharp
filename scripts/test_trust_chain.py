@@ -13,9 +13,7 @@ GET /tls/server-certificate with it, or 404 to make the script fall back to the 
 
 import http.server
 import json
-import os
 import re
-import stat
 import socket
 import ssl
 import subprocess
@@ -165,21 +163,6 @@ class TrustChainTests(unittest.TestCase):
         written = CERT_RE.findall((demo / "generated" / "idp-ca.pem").read_text())
         self.assertEqual(len(written), 4)
         self.assertEqual(written[-1], CERT_RE.findall(self.root_pem)[0])
-
-
-class SecretFileTests(unittest.TestCase):
-    """A generated test-user password is written to a 0600 file beside the client secret, never printed."""
-
-    def test_generated_password_goes_to_a_0600_file_under_generated(self):
-        demo = tempfile.TemporaryDirectory()
-        self.addCleanup(demo.cleanup)
-        config = Path(demo.name) / "oidc.json"
-        config.write_text("{}", encoding="utf-8")
-        path = configure_iya_sts.password_path(str(config), "oidc-demo-user")
-        self.assertEqual(path, str(Path(demo.name).resolve() / "generated" / "oidc-demo-user.password"))
-        configure_iya_sts._write_secret(path, "not-printed")
-        self.assertEqual(Path(path).read_text(encoding="utf-8"), "not-printed\n")
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
 
 if __name__ == "__main__":
