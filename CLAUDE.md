@@ -13,7 +13,7 @@ The license is the MIT License in `LICENSE`. A pull request merged into `main` p
 | Path | What it is |
 |---|---|
 | namespace `IyaSec.Oidc` | The library. `FromFile`, `Authorize`, `Complete`. Package `IyaSec.OidcCaepRisc`. |
-| `tests/IyaSec.OidcCaepRisc.Tests` | `dotnet test`. A stub provider and a stub transmitter. No live iya-sts. |
+| `tests/IyaSec.OidcCaepRisc.Tests` | `dotnet test`. A stub provider and a stub transmitter. No live iya-sts. `TlsTrustTests` runs a leaf-only HTTPS listener against `tlsCa`: a certificate that chains to it but names another host is refused (`Http.Accept`; an IP literal needs an IP SAN). |
 | `demo` | `demo/Program.cs` and `demo/public/`. Config is `demo/oidc.json`. |
 | `scripts` | `configure_iya_sts.py` registers the confidential client. `trust_chain.py` refreshes the listener CA file named by `tlsCa`. `live_iya_sts.py` is the live sign-in, separate from the unit suite. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |
