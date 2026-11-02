@@ -21,6 +21,8 @@ var who = rp.Complete(query, request);
 
 Tokens stay in this process. Keep the transaction until the browser returns.
 
+`tlsCa` names the iya-sts TLS listener CA trust chain for every back-channel request. A certificate the platform already trusts, or one that chains to `tlsCa`, is accepted only when it names the host in the URL: a DNS name must match a DNS SAN and an IP literal such as `127.0.0.1` an IP address SAN. A certificate that chains to `tlsCa` but names another host is refused.
+
 ## Tests
 
 ```bash
