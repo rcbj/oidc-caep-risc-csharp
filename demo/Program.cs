@@ -82,7 +82,7 @@ while (listener.IsListening)
         Console.Error.WriteLine("demo: " + err);
         try
         {
-            application.Send(context.Response, 500, Page("Error", "<h1>Something went wrong</h1><p class=\"problem\">" + Web(err.Message) + "</p><p><a href=\"/\">Home</a></p>"), "text/html; charset=utf-8", null);
+            application.Send(context.Response, 500, Page("Error", "<h1>Something went wrong</h1><p class=\"problem\">" + DemoApp.Logged + "</p><p><a href=\"/\">Home</a></p>"), "text/html; charset=utf-8", null);
         }
         catch (Exception)
         {
@@ -253,51 +253,45 @@ sealed class DemoApp
 
     public bool SecureCookies { get; set; }
 
+    // What a page says in place of an exception's text, which goes to the demo's log instead: an
+    // exception message can carry configuration paths and server details (CodeQL
+    // cs/information-exposure-through-exception).
+    public const string Logged = "The reason is in the demo's log.";
+
+    // The handlers, keyed by "METHOD /path". A table lookup picks the handler, so no handler is guarded
+    // by comparing the request's own path or method string in this code (CodeQL cs/user-controlled-bypass).
+    Dictionary<string, Action<HttpListenerContext>>? routes;
+
+    Dictionary<string, Action<HttpListenerContext>> Routes() => routes ??= new()
+    {
+        ["GET /healthz"] = context => Send(context.Response, 200, "ok", "text/plain", null),
+        ["GET /live-status"] = LiveStatus,
+        ["GET /styles.css"] = context => Send(context.Response, 200, ReadAsset("styles.css"), "text/css; charset=utf-8", null),
+        ["GET /app.js"] = context => Send(context.Response, 200, ReadAsset("app.js"), "text/javascript; charset=utf-8", null),
+        ["GET /"] = Home,
+        ["GET /login"] = Login,
+        ["GET /callback"] = Callback,
+        ["POST /logout"] = Logout,
+    };
+
     public void Route(HttpListenerContext context)
     {
         var request = context.Request;
-        var path = request.Url?.AbsolutePath ?? "/";
-        if (path == "/healthz")
-        {
-            Send(context.Response, 200, "ok", "text/plain", null);
-            return;
-        }
-        if (path == "/live-status" && request.HttpMethod == "GET")
-        {
-            LiveStatus(context);
-            return;
-        }
-        if (path == "/styles.css" && request.HttpMethod == "GET")
-        {
-            Send(context.Response, 200, ReadAsset("styles.css"), "text/css; charset=utf-8", null);
-            return;
-        }
-        if (path == "/app.js" && request.HttpMethod == "GET")
-        {
-            Send(context.Response, 200, ReadAsset("app.js"), "text/javascript; charset=utf-8", null);
-            return;
-        }
-        if (path == "/" && request.HttpMethod == "GET")
-        {
-            Home(context);
-            return;
-        }
-        if (path == "/login" && request.HttpMethod == "GET")
-        {
-            Login(context);
-            return;
-        }
-        if (path == "/callback" && request.HttpMethod == "GET")
-        {
-            Callback(context);
-            return;
-        }
-        if (path == "/logout" && request.HttpMethod == "POST")
-        {
-            Logout(context);
-            return;
-        }
+        var key = request.HttpMethod + " " + (request.Url?.AbsolutePath ?? "/");
+        var handler = Routes().GetValueOrDefault(key, NotFound);
+        handler(context);
+    }
+
+    void NotFound(HttpListenerContext context)
+    {
         Send(context.Response, 404, Page("Not found", "<h1>Not found</h1>"), "text/html; charset=utf-8", null);
+    }
+
+    // Logs an exception and answers a page that does not carry its text.
+    void Failed(HttpListenerContext context, int status, string title, string where, Exception err, IEnumerable<string>? cookies, string shown)
+    {
+        Console.Error.WriteLine("demo: " + where + ": " + err);
+        Send(context.Response, status, Page(title, "<h1>" + Web(title) + "</h1><p class=\"problem\">" + Web(shown) + "</p><p><a href=\"/\">Start again</a></p>"), "text/html; charset=utf-8", cookies);
     }
 
     void Home(HttpListenerContext context)
@@ -312,7 +306,8 @@ sealed class DemoApp
         catch (Exception err)
         {
             party = null;
-            problem = "The relying party is not configured yet: " + err.Message + ". Run scripts/configure_iya_sts.py.";
+            Console.Error.WriteLine("demo: the relying party is not configured: " + err);
+            problem = "The relying party is not configured yet. Run scripts/configure_iya_sts.py. " + Logged;
         }
         if (sess?.Login != null)
         {
@@ -413,7 +408,7 @@ sealed class DemoApp
         }
         catch (Exception err)
         {
-            Send(context.Response, 500, Page("Error", "<h1>Something went wrong</h1><p class=\"problem\">" + Web(err.Message) + "</p>"), "text/html; charset=utf-8", null);
+            Failed(context, 500, "Something went wrong", "sign-in", err, null, Logged);
             return;
         }
         RelyingParty.Transaction request;
@@ -423,7 +418,7 @@ sealed class DemoApp
         }
         catch (Exception err)
         {
-            Send(context.Response, 500, Page("Error", "<h1>Something went wrong</h1><p class=\"problem\">" + Web(err.Message) + "</p>"), "text/html; charset=utf-8", null);
+            Failed(context, 500, "Something went wrong", "sign-in", err, null, Logged);
             return;
         }
         var txn = new Dictionary<string, string>
@@ -446,7 +441,7 @@ sealed class DemoApp
         }
         catch (Exception err)
         {
-            Send(context.Response, 500, Page("Error", "<h1>Something went wrong</h1><p class=\"problem\">" + Web(err.Message) + "</p>"), "text/html; charset=utf-8", new[] { clear });
+            Failed(context, 500, "Something went wrong", "callback", err, new[] { clear }, Logged);
             return;
         }
         var query = new Dictionary<string, string>();
@@ -478,8 +473,10 @@ sealed class DemoApp
         }
         catch (Exception err)
         {
-            var what = err is OidcError oidc ? oidc.Code + ": " + oidc.Message : err.Message;
-            Send(context.Response, 400, Page("Sign-in failed", "<h1>Sign-in failed</h1><p class=\"problem\">" + Web(what) + "</p><p><a href=\"/\">Start again</a></p>"), "text/html; charset=utf-8", new[] { clear });
+            // The page names the library's error code (validation, access_denied, ...), a fixed vocabulary;
+            // the message, which can quote what the provider sent, goes to the log only.
+            var code = err is OidcError oidc ? oidc.Code : "error";
+            Failed(context, 400, "Sign-in failed", "sign-in refused", err, new[] { clear }, code + ". " + Logged);
             return;
         }
         var sid = Codec.RandomToken();
@@ -592,7 +589,7 @@ sealed class DemoApp
         }
         catch (Exception err)
         {
-            receiverState = "not running: " + err.Message;
+            receiverState = "not running. " + Logged;
             Console.Error.WriteLine("ssf: the receiver did not start: " + err);
             return;
         }
@@ -605,7 +602,7 @@ sealed class DemoApp
         catch (Exception err)
         {
             receiver = null;
-            receiverState = "not running: " + err.Message;
+            receiverState = "not running. " + Logged;
             Console.Error.WriteLine("ssf: the receiver did not start: " + err);
             return;
         }
