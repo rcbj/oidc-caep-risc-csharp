@@ -8,6 +8,10 @@ The license is MIT. Package id: `IyaSec.OidcCaepRisc`. A pull request merged int
 
 ## Usage
 
+```bash
+dotnet add package IyaSec.OidcCaepRisc
+```
+
 ```csharp
 var rp = IyaSec.Oidc.RelyingParty.FromFile("oidc.json");
 var request = rp.Authorize();
