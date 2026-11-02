@@ -24,6 +24,9 @@ public class TlsTrustTests
     {
         public X509Certificate2 Leaf = null!;
         public string Pem = "";
+        // The CA certificates (issuing, intermediate, root), public, as a server could send them.
+        public X509Certificate2Collection Authorities = new();
+        public string AuthoritiesPem = "";
     }
 
     static Chain MakeChain(string name, Action<SubjectAlternativeNameBuilder> names)
@@ -62,6 +65,13 @@ public class TlsTrustTests
         {
             Leaf = new X509Certificate2(leafWithKey.Export(X509ContentType.Pkcs12)),
             Pem = Pem(leaf) + Pem(issuing) + Pem(mid) + Pem(root),
+            Authorities = new X509Certificate2Collection
+            {
+                new X509Certificate2(issuing.RawData),
+                new X509Certificate2(mid.RawData),
+                new X509Certificate2(root.RawData),
+            },
+            AuthoritiesPem = Pem(issuing) + Pem(mid) + Pem(root),
         };
     }
 
@@ -75,14 +85,16 @@ public class TlsTrustTests
         san.AddIpAddress(IPAddress.Loopback);
     }
 
-    // A one-connection-at-a-time HTTPS server that presents only the leaf.
+    // A one-connection-at-a-time HTTPS server that presents the leaf, and the
+    // extra certificates after it when any are given.
     sealed class TlsServer : IDisposable
     {
         readonly TcpListener _tcp = new(IPAddress.Loopback, 0);
         public int Port => ((IPEndPoint)_tcp.LocalEndpoint).Port;
 
-        public TlsServer(X509Certificate2 leaf)
+        public TlsServer(X509Certificate2 leaf, X509Certificate2Collection? sent = null)
         {
+            var context = SslStreamCertificateContext.Create(leaf, sent ?? new X509Certificate2Collection(), offline: true);
             _tcp.Start();
             new Thread(() =>
             {
@@ -96,7 +108,7 @@ public class TlsTrustTests
                         using (client)
                         using (var tls = new SslStream(client.GetStream()))
                         {
-                            tls.AuthenticateAsServer(leaf, false, false);
+                            tls.AuthenticateAsServer(new SslServerAuthenticationOptions { ServerCertificateContext = context });
                             var head = new StringBuilder();
                             var one = new byte[1];
                             while (!head.ToString().EndsWith("\r\n\r\n", StringComparison.Ordinal) && tls.Read(one, 0, 1) == 1)
@@ -114,9 +126,9 @@ public class TlsTrustTests
         public void Dispose() => _tcp.Stop();
     }
 
-    static OidcError? Fetch(Chain chain, string host, string? caPem = null)
+    static OidcError? Fetch(Chain chain, string host, string? caPem = null, X509Certificate2? leaf = null, X509Certificate2Collection? sent = null)
     {
-        using var server = new TlsServer(chain.Leaf);
+        using var server = new TlsServer(leaf ?? chain.Leaf, sent);
         try
         {
             var answer = Http.Send("https://" + host + ":" + server.Port + "/", "GET", new Dictionary<string, string>(), null, new Dictionary<string, string> { ["ca"] = caPem ?? chain.Pem }, "discovery");
@@ -132,6 +144,31 @@ public class TlsTrustTests
     {
         var chain = MakeChain("sts", IyaStsNames);
         Assert.Null(Fetch(chain, "127.0.0.1"));
+    }
+
+    // The first block of the file is the TLS Issuing CA and the root is the
+    // last: the listener sends only its leaf, so it is accepted only when every
+    // block of the file is read.
+    [Fact]
+    public void EveryPemBlockOfTheFileIsRead()
+    {
+        var chain = MakeChain("sts", IyaStsNames);
+        Assert.Null(Fetch(chain, "127.0.0.1", chain.AuthoritiesPem));
+    }
+
+    // No pin shortcut: the CA certificates are public, so a server may send its
+    // own leaf, carrying the right names, followed by the real issuing,
+    // intermediate and root. It does not chain to the file and is refused.
+    [Fact]
+    public void AForgedLeafFollowedByTheRealAuthoritiesIsRefused()
+    {
+        var chain = MakeChain("sts", IyaStsNames);
+        var forged = MakeChain("sts", IyaStsNames);
+        var err = Fetch(chain, "127.0.0.1", chain.Pem, forged.Leaf, chain.Authorities);
+        Assert.NotNull(err);
+        Assert.Equal("discovery", err!.Code);
+        err = Fetch(chain, "localhost", chain.Pem, forged.Leaf, chain.Authorities);
+        Assert.NotNull(err);
     }
 
     [Fact]

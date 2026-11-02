@@ -91,8 +91,9 @@ def usage():
                   (default: unset; $PUBLIC_URL). Without it, a loopback redirect follows the
                   running demo's PORT, then $PORT. A non-loopback redirect is left as written.
   --test-user     The test user to create (default: oidc-demo-user). Its password is
-                  $OIDC_DEMO_USER_PASSWORD, or one is generated and printed once. With that variable
-                  set, an existing user's password is replaced.
+                  $OIDC_DEMO_USER_PASSWORD, or one is generated and written to
+                  demo/generated/<name>.password (mode 0600); only that path is printed. With that
+                  variable set, an existing user's password is replaced.
   --no-test-user  Do not create a test user.
   --dry-run       Print what would be done, and send nothing. Does not write a secret.
 
@@ -400,9 +401,18 @@ def _mint_admin_token(base, ca, secret):
 
 
 def _write_secret(path, secret):
+    """Write a secret to a file created mode 0600, so it is never readable by others, even briefly."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(f"{secret}\n", encoding="utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        out.write(f"{secret}\n")
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def password_path(config_path, user):
+    """Where a generated test-user password goes: generated/<user>.password beside the configuration."""
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(user)) or "user"
+    return str(Path(config_path).resolve().parent / "generated" / f"{safe}.password")
 
 
 def container_port(cwd=None):
@@ -543,7 +553,11 @@ def main(argv=None):
                 raise RuntimeError(f"creating {args['testUser']} was refused: {json.dumps(made['body'])[:300]}")
             print(f"Created user {args['testUser']}.")
             if made["body"].get("password"):
-                print(f"Generated password for {args['testUser']} (shown once): {made['body']['password']}")
+                # A generated password is never printed: it goes to a 0600 file beside the client
+                # secret, and only the path is shown.
+                password_file = password_path(args["config"], args["testUser"])
+                _write_secret(password_file, made["body"]["password"])
+                print(f"Generated a password for {args['testUser']}; it is in {password_file} (mode 0600).")
         for call in plan:
             if not call["path"].endswith("/groups/add-member"):
                 continue
