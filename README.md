@@ -23,6 +23,14 @@ Tokens stay in this process. Keep the transaction until the browser returns.
 
 `tlsCa` names the iya-sts TLS listener CA trust chain for every back-channel request. A certificate the platform already trusts, or one that chains to `tlsCa`, is accepted only when it names the host in the URL: a DNS name must match a DNS SAN and an IP literal such as `127.0.0.1` an IP address SAN. A certificate that chains to `tlsCa` but names another host is refused.
 
+## The iya-sts trust chain (`tlsCa`)
+
+`tlsCa` in `demo/oidc.json` (default `generated/idp-ca.pem`, relative to `demo/`) names the iya-sts TLS listener CA trust chain. The install script, `python3 scripts/configure_iya_sts.py`, fetches the whole chain iya-sts publishes at `GET /tls/server-certificate` (leaf, TLS Issuing CA, Intermediate, Root; the chain the handshake presents when that is missing), writes it to that file, and prints the path, the anchor's subject and its SHA-256. The library reads every PEM block of the file as its trust store.
+
+The demo image carries that file from build time: `COPY demo demo` takes it in, and `.dockerignore` admits it and nothing else under `demo/generated` (the client secret and a generated test-user password stay out). Build the demo image after the install script has run, and rebuild it after re-running the install script against a different iya-sts. A build without the file (CI, a fresh clone) still succeeds. At start the container refreshes the file from iya-sts and keeps the built-in one when that fails; `TLS_CA_REFRESH=0` turns the refresh off.
+
+The install script never prints a generated test-user password: it writes it to `demo/generated/<user>.password` (mode 0600) and prints that path. The client secret is `demo/generated/client-secret` (mode 0600), mounted into the demo container, never built into the image.
+
 ## Tests
 
 ```bash
@@ -33,7 +41,7 @@ The suite runs in a container.
 
 The tests build an in-process stub provider and a stub transmitter. They do not need a live iya-sts.
 
-`python3 scripts/live_iya_sts.py` is the live half. It builds this demo image, starts iya-sts when `IYA_STS_URL` is unset, registers the demo, signs in, and requires a credential-change event and a session-revoked event on `GET /live-status`. The second event ends the local session. The nightly workflow runs the unit suite and this script. `.github/workflows/nightly.yml` runs at 07:34 UTC (`34 7 * * *`) and on `workflow_dispatch`. `IYA_STS_IMAGE` starts a fresh container from an image already built; without it or `IYA_STS_URL` the script clones and builds iya-sts `main`. `LIVE_STS_PORT` defaults to 18524 and `LIVE_DEMO_PORT` to 18624; the script refuses 3000, 8081, and 18481 through 18495. Registration runs `scripts/configure_iya_sts.py` with the host's stdlib python3, never dotnet. Always use a fresh iya-sts: a second registration of the same client fails.
+`python3 scripts/live_iya_sts.py` is the live half. It starts iya-sts when `IYA_STS_URL` is unset, runs the install script in a copy of the repository (which writes the client secret and the trust chain into that copy's `demo/generated`), then builds the demo image, checks that the image holds the saved chain and no client secret, and runs it with only the client secret mounted and `TLS_CA_REFRESH=0`. It then signs in, and requires a credential-change event and a session-revoked event on `GET /live-status`. The second event ends the local session. The nightly workflow runs the unit suite and this script. `.github/workflows/nightly.yml` runs at 07:34 UTC (`34 7 * * *`) and on `workflow_dispatch`. `IYA_STS_IMAGE` starts a fresh container from an image already built; without it or `IYA_STS_URL` the script clones and builds iya-sts `main`. `LIVE_STS_PORT` defaults to 18524 and `LIVE_DEMO_PORT` to 18624; the script refuses 3000, 8081, and 18481 through 18495. Registration runs `scripts/configure_iya_sts.py` with the host's stdlib python3, never dotnet. Always use a fresh iya-sts: a second registration of the same client fails.
 
 ## Layout
 
