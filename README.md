@@ -29,7 +29,7 @@ Tokens stay in this process. Keep the transaction until the browser returns.
 
 The demo image carries that file from build time: `COPY demo demo` takes it in, and `.dockerignore` admits it and nothing else under `demo/generated` (the client secret and a generated test-user password stay out). Build the demo image after the install script has run, and rebuild it after re-running the install script against a different iya-sts. A build without the file (CI, a fresh clone) still succeeds. At start the container refreshes the file from iya-sts and keeps the built-in one when that fails; `TLS_CA_REFRESH=0` turns the refresh off.
 
-The install script never prints a generated test-user password: it writes it to `demo/generated/<user>.password` (mode 0600) and prints that path. The client secret is `demo/generated/client-secret` (mode 0600), mounted into the demo container, never built into the image.
+The install script never prints a generated test-user password: it writes it to `demo/generated/<user>.password` (mode 0600) and prints only that path. The client secret is `demo/generated/client-secret` (mode 0600), mounted into the demo container, never built into the image; it is never printed, and `--dry-run`'s plan does not hold it.
 
 ## Tests
 
