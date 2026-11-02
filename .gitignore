@@ -1,0 +1,10 @@
+bin/
+obj/
+demo/generated/
+.vs/
+*.user
+TestResults/
+__pycache__/
+*.pyc
+venv/
+.venv/

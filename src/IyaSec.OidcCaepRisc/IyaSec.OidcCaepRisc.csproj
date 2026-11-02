@@ -1,0 +1,17 @@
+<!-- SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC -->
+<!-- SPDX-License-Identifier: MIT -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>IyaSec.Oidc</RootNamespace>
+    <AssemblyName>IyaSec.OidcCaepRisc</AssemblyName>
+    <Version>0.1.0</Version>
+    <Description>Confidential OpenID Connect relying party and one CAEP/RISC poll stream</Description>
+    <Authors>Iya CyberSecurity Solutions, LLC</Authors>
+    <Copyright>2026 Iya CyberSecurity Solutions, LLC</Copyright>
+    <PackageId>IyaSec.OidcCaepRisc</PackageId>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+</Project>
