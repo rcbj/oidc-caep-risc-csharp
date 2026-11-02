@@ -54,7 +54,7 @@ The stub tests do not start iya-sts. `python3 scripts/live_iya_sts.py` does, unl
 docker compose up --build
 ```
 
-`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. `GET /live-status` is JSON for the sign-in and the Shared Signals events this process has accepted. It does not include tokens.
+`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. `GET /live-status` is JSON for the sign-in and the Shared Signals events this process has accepted. It does not include tokens. The demo and the test stub provider pick handlers from a table keyed by method and path, not an if-chain on the request (CodeQL cs/user-controlled-bypass). A page never shows an exception message: the demo logs it and the page says the reason is in the log; a refused sign-in shows only the library error code (CodeQL cs/information-exposure-through-exception).
 
 A loopback redirect follows `PORT` in the running server and in `scripts/configure_iya_sts.py`. Any other host is left as written. An explicit `--public-url` or a non-empty `PUBLIC_URL` replaces the origin and keeps the path. The running container's `PORT` wins over the shell's when the script registers the application. `pollIntervalMs` is a millisecond pause, not a port.
 
