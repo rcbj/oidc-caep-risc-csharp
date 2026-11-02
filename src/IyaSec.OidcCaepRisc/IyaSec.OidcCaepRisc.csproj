@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>IyaSec.Oidc</RootNamespace>
     <AssemblyName>IyaSec.OidcCaepRisc</AssemblyName>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Description>Confidential OpenID Connect relying party and one CAEP/RISC poll stream</Description>
     <Authors>Iya CyberSecurity Solutions, LLC</Authors>
     <Copyright>2026 Iya CyberSecurity Solutions, LLC</Copyright>

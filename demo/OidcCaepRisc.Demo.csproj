@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>IyaSec.Oidc</RootNamespace>
     <AssemblyName>oidc-caep-risc-demo</AssemblyName>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\src\IyaSec.OidcCaepRisc\IyaSec.OidcCaepRisc.csproj" />
