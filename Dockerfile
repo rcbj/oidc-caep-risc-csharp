@@ -28,6 +28,6 @@ ENV PORT=3000
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 EXPOSE 3000
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s \
-  CMD curl -fsS "http://127.0.0.1:$$PORT/healthz" || exit 1
+  CMD curl -fsS "http://127.0.0.1:$PORT/healthz" || exit 1
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["dotnet", "/app/oidc-caep-risc-demo.dll"]
