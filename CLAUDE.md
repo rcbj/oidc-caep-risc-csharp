@@ -20,10 +20,6 @@ The license is the MIT License in `LICENSE`. Publishing is not set up. `develop`
 
 ## Usage
 
-```sh
-dotnet test
-```
-
 ```csharp
 var rp = IyaSec.Oidc.RelyingParty.FromFile("oidc.json");
 var request = rp.Authorize();
@@ -34,16 +30,18 @@ Keep the transaction (`State`, nonce, code verifier) until the browser returns. 
 
 ## Tests
 
-```sh
-dotnet test
+```bash
+docker build --target test .
 ```
+
+The `test` stage runs `dotnet test --nologo` in `mcr.microsoft.com/dotnet/sdk:8.0`. GitHub Actions uses that command. Do not run the .NET SDK on the host. The demo image does not run the suite.
 
 ## Demo
 
 `docker-compose.yml` sets `network_mode: host`. The process binds `PORT`, default 3000. `ENV PORT=3000` in the image keeps an unset value on 3000, and the health check calls `http://127.0.0.1:${PORT}/healthz`.
 
 ```sh
-dotnet run --project demo/OidcCaepRisc.Demo.csproj
+docker compose up --build
 ```
 
 `GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session.
