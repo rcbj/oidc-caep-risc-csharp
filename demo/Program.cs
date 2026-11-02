@@ -473,10 +473,19 @@ sealed class DemoApp
         }
         catch (Exception err)
         {
-            // The page names the library's error code (validation, access_denied, ...), a fixed vocabulary;
-            // the message, which can quote what the provider sent, goes to the log only.
-            var code = err is OidcError oidc ? oidc.Code : "error";
-            Failed(context, 400, "Sign-in failed", "sign-in refused", err, new[] { clear }, code + ". " + Logged);
+            // The page names the kind of failure from the library's fixed set of error codes, written
+            // here as literals so no exception text reaches the page; the message, which can quote what
+            // the provider sent, goes to the log only.
+            var kind = (err as OidcError)?.Code switch
+            {
+                "validation" => "validation",
+                "signature" => "signature",
+                "protocol" => "protocol",
+                "discovery" => "discovery",
+                "config" => "config",
+                _ => "error",
+            };
+            Failed(context, 400, "Sign-in failed", "sign-in refused", err, new[] { clear }, kind + ". " + Logged);
             return;
         }
         var sid = Codec.RandomToken();
