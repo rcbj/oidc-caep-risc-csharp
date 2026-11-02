@@ -240,6 +240,7 @@ sealed class DemoApp
     bool loaded;
     SignalsReceiver? receiver;
     string receiverState = "";
+    readonly List<(string Type, string? Jti)> liveEvents = new();
 
     public DemoApp(byte[] secret, string configPath, string publicUrl, bool publicGiven)
     {
@@ -259,6 +260,11 @@ sealed class DemoApp
         if (path == "/healthz")
         {
             Send(context.Response, 200, "ok", "text/plain", null);
+            return;
+        }
+        if (path == "/live-status" && request.HttpMethod == "GET")
+        {
+            LiveStatus(context);
             return;
         }
         if (path == "/styles.css" && request.HttpMethod == "GET")
@@ -344,6 +350,58 @@ sealed class DemoApp
             + "<p>This application is a confidential client" + issuer
             + ". It sends the browser to the authorization endpoint (Authorization Code, PKCE S256) and takes the tokens on the back channel.</p><p class=\"buttons\"><a class=\"button primary\" href=\"/login\">Sign in with OpenID Connect</a></p>";
         Send(context.Response, 200, Page("Sign in", signedOut), "text/html; charset=utf-8", null);
+    }
+
+    // GET /live-status: the sign-in and the Shared Signals events this process has
+    // accepted, for scripts/live_iya_sts.py. It never carries a token or an ID Token.
+    void LiveStatus(HttpListenerContext context)
+    {
+        var (_, sess) = SessionOf(context.Request);
+        string? subject = null;
+        if (sess?.Login != null)
+        {
+            var login = sess.Login;
+            subject = login.PreferredUsername;
+            if (string.IsNullOrEmpty(subject)) subject = login.Email;
+            if (string.IsNullOrEmpty(subject)) subject = login.Subject;
+            if (string.IsNullOrEmpty(subject)) subject = null;
+        }
+        List<Dictionary<string, object?>> events;
+        string state;
+        lock (gate)
+        {
+            events = liveEvents.Select(item => new Dictionary<string, object?> { ["type"] = item.Type, ["jti"] = item.Jti }).ToList();
+            state = receiverState;
+        }
+        var body = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["signedIn"] = sess?.Login != null,
+            ["subject"] = subject,
+            ["receiver"] = state,
+            ["events"] = events,
+        });
+        Send(context.Response, 200, body, "application/json", null);
+    }
+
+    // Every accepted event is remembered for /live-status. The receiver ends a
+    // session only when the event's IdP session id matches one it tracks; a
+    // session-revoked that matched none ends this demo's one local session.
+    void RememberLiveEvent(Dictionary<string, object?> signal)
+    {
+        var type = Sprint(signal.GetValueOrDefault("type"));
+        var jti = Sprint(signal.GetValueOrDefault("jti"));
+        string? only = null;
+        SignalsReceiver? current;
+        lock (gate)
+        {
+            liveEvents.Add((type, jti.Length == 0 ? null : jti));
+            current = receiver;
+            var matched = signal.GetValueOrDefault("sessions") is System.Collections.ICollection list && list.Count > 0;
+            if (type != Events.Event["sessionRevoked"] || matched || sessions.Count != 1) return;
+            only = sessions.Keys.First();
+            sessions.Remove(only);
+        }
+        if (only != null) current?.Untrack(only);
     }
 
     void Login(HttpListenerContext context)
@@ -538,6 +596,7 @@ sealed class DemoApp
             Console.Error.WriteLine("ssf: the receiver did not start: " + err);
             return;
         }
+        built.On("*", RememberLiveEvent);
         receiver = built;
         try
         {
