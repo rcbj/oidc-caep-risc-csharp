@@ -24,7 +24,7 @@ public static class Http
         {
             throw new OidcError(code, url + " is not an http(s) URL");
         }
-        var client = Client(tls, code, url);
+        var client = Client(tls, code, url, uri);
         using var request = new HttpRequestMessage(new HttpMethod(method), uri);
         request.Version = HttpVersion.Version11;
         request.VersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
@@ -93,13 +93,13 @@ public static class Http
         return memory.ToArray();
     }
 
-    static HttpClient Client(IReadOnlyDictionary<string, string>? tls, string code, string url)
+    static HttpClient Client(IReadOnlyDictionary<string, string>? tls, string code, string url, Uri uri)
     {
         var ca = tls != null && tls.TryGetValue("ca", out var pem) ? pem : null;
         if (string.IsNullOrEmpty(ca)) return Plain;
         try
         {
-            return Build(ca);
+            return Build(ca, HostOf(uri));
         }
         catch (OidcError)
         {
@@ -111,7 +111,7 @@ public static class Http
         }
     }
 
-    static HttpClient Build(string? ca)
+    static HttpClient Build(string? ca, string host = "")
     {
         var handler = new SocketsHttpHandler
         {
@@ -135,19 +135,50 @@ public static class Http
             if (extra.Count == 0) throw new OidcError("config", "the configured tlsCa is not a PEM trust anchor");
             handler.SslOptions = new SslClientAuthenticationOptions
             {
-                RemoteCertificateValidationCallback = (sender, cert, chain, errors) =>
-                {
-                    if (errors == SslPolicyErrors.None) return true;
-                    if (cert == null) return false;
-                    using var built = new X509Chain();
-                    built.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-                    built.ChainPolicy.CustomTrustStore.AddRange(extra);
-                    built.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-                    return built.Build(new X509Certificate2(cert));
-                },
+                RemoteCertificateValidationCallback = (_, cert, _, errors) => Accept(cert, errors, extra, host),
             };
         }
         return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(TimeoutSeconds) };
+    }
+
+    // The callback replaces the platform's whole decision, the name check
+    // included. A chain error alone is answered by building to the configured
+    // anchors; a name the host does not match is refused whatever the chain,
+    // and the name is checked here as well rather than trusted to the flag.
+    // An IP literal must match an IP address SAN.
+    internal static bool Accept(X509Certificate? cert, SslPolicyErrors errors, X509Certificate2Collection anchors, string host)
+    {
+        if (cert == null) return false;
+        if ((errors & SslPolicyErrors.RemoteCertificateNameMismatch) != 0) return false;
+        if ((errors & SslPolicyErrors.RemoteCertificateNotAvailable) != 0) return false;
+        using var leaf = new X509Certificate2(cert);
+        if (!NameMatches(leaf, host)) return false;
+        if (errors == SslPolicyErrors.None) return true;
+        using var built = new X509Chain();
+        built.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        built.ChainPolicy.CustomTrustStore.AddRange(anchors);
+        built.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        return built.Build(leaf);
+    }
+
+    static string HostOf(Uri uri)
+    {
+        var host = uri.IdnHost;
+        if (host.StartsWith('[') && host.EndsWith(']')) host = host[1..^1];
+        return host;
+    }
+
+    static bool NameMatches(X509Certificate2 leaf, string host)
+    {
+        if (string.IsNullOrEmpty(host)) return false;
+        try
+        {
+            return leaf.MatchesHostname(host, allowWildcards: true, allowCommonName: false);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     static X509Certificate2Collection LoadPem(string pem)
