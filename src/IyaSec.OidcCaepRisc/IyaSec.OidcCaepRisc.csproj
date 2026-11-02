@@ -13,5 +13,14 @@
     <Copyright>2026 Iya CyberSecurity Solutions, LLC</Copyright>
     <PackageId>IyaSec.OidcCaepRisc</PackageId>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IsPackable>true</IsPackable>
+    <PackageProjectUrl>https://github.com/rcbj/oidc-caep-risc-csharp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/rcbj/oidc-caep-risc-csharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>openid-connect;oidc;caep;risc;ssf</PackageTags>
   </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 </Project>
