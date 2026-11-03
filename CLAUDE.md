@@ -13,7 +13,7 @@ The license is the MIT License in `LICENSE`. A pull request merged into `main` p
 | Path | What it is |
 |---|---|
 | namespace `IyaSec.Oidc` | The library. `FromFile`, `Authorize`, `Complete`. Package `IyaSec.OidcCaepRisc`. |
-| `tests/IyaSec.OidcCaepRisc.Tests` | `dotnet test`. A stub provider and a stub transmitter. No live iya-sts. `TlsTrustTests` runs a leaf-only HTTPS listener against `tlsCa`: a certificate that chains to it but names another host is refused (`Http.Accept`; an IP literal needs an IP SAN). Every PEM block of the file is read (`Http.LoadPem`), and a forged leaf sent with the real CA certificates is refused: there is no pin shortcut. |
+| `tests/IyaSec.OidcCaepRisc.Tests` | `dotnet test`. A stub provider and a stub transmitter. No live iya-sts. `TlsTrustTests` runs a leaf-only HTTPS listener against `tlsCa`: a certificate that chains to it but names another host is refused (`Http.Accept`; an IP literal needs an IP SAN). Every PEM block of the file is read (`Http.LoadPem`), and a forged leaf sent with the real CA certificates is refused: there is no pin shortcut. `ClientProfileTests` covers issue #30 (DPoP, acr, required PAR, the algorithm allow-list, required `typ`/`at_hash`, `Create` defaults and the redirect rule, the session token cache); the stubs check each DPoP proof with `DpopProof`, written apart from the library's signer. `DpopSignalsTests` requires a proof on every transmitter call. |
 | `demo` | `demo/Program.cs` and `demo/public/`. Config is `demo/oidc.json`. |
 | `scripts` | `configure_iya_sts.py` registers the confidential client. `trust_chain.py` refreshes the listener CA file named by `tlsCa`. `live_iya_sts.py` is the live sign-in, separate from the unit suite. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |
@@ -26,7 +26,35 @@ var request = rp.Authorize();
 var who = rp.Complete(query, request);
 ```
 
-Keep the transaction (`State`, nonce, code verifier) until the browser returns. Tokens stay in this process.
+Keep the transaction (`State`, nonce, code verifier, `AcrValues`) until the browser returns. Tokens stay in this process.
+
+## Client profile settings
+
+These defaults apply whether the configuration is read from a file (`RelyingParty.FromFile`, `Config.ResolveConfig`) or built in code and given to `RelyingParty.Create` (`Config.ApplyDefaults` is the one place they are set).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `par` | `auto` | `auto` pushes the authorization request when the provider has a PAR endpoint, `always` requires one (creation fails without it), `never` does not push. When discovery says `require_pushed_authorization_requests: true`, `never` fails at creation and `auto` always pushes. |
+| `dpop` | `auto` | DPoP (RFC 9449). `auto` uses it when the provider's `dpop_signing_alg_values_supported` lists ES256; `always` fails at creation otherwise; `never` sends no proofs. |
+| `dpopKey` | none | A PEM P-256 private key (inline, `file:`, `env:`, or a path) for the DPoP proofs, for an application that runs several processes. Without it the key pair is generated when the relying party is created and held in memory only. |
+| `idTokenSigningAlgs` | `["RS256"]` | The ID token algorithms accepted, intersected with the provider's `id_token_signing_alg_values_supported`; creation fails when the intersection is empty. `none` is never accepted. A symmetric algorithm (HS256, HS384, HS512) is accepted only when named here. |
+| `idTokenSignedResponseAlg` | none | Pins one algorithm; the provider must advertise it. |
+| `requireIdTokenTypAndAtHash` | `true` | The ID token header must carry `typ` `JWT` or `application/jwt`, and when the token response carries an access token the ID token must carry a matching `at_hash`. `false` checks each only when present. |
+| `acrValues` | none | `acr_values` (a string or a list) sent on every authorization request; `AuthorizeOptions.AcrValues` overrides it per request. When `acr_values` was sent, the code exchange's ID token must carry an `acr` that is one of them. The refresh path does not re-check `acr`. |
+| `clockToleranceSec` | 30 | Clock skew for `exp`, `nbf`, `iat`, and `auth_time`. An `iat` more than this in the future is refused. |
+| `maxIdTokenAgeSec` | 600 | The oldest `iat` accepted. |
+
+`redirectUri`, `postLogoutRedirectUri`, and a per-request `AuthorizeOptions.RedirectUri` must be https, or http on a loopback host (`localhost`, `127.0.0.1`, `[::1]`). `allowInsecure` does not relax this; it only lets the provider's own endpoints use http.
+
+### DPoP
+
+When DPoP is in use, a proof (`typ` `dpop+jwt`, the public `jwk`, `jti`, `htm`, `htu` without query or fragment, `iat`) goes on every PAR request and every token request (code, refresh, client credentials), and `dpop_jkt` (the key's RFC 7638 thumbprint) goes on the authorization request (in the PAR body when PAR is used). The token response's `token_type` must then be `DPoP`; without a proof it must be `Bearer`. A 400 `use_dpop_nonce` from the authorization server, or a 401 with `WWW-Authenticate: DPoP error="use_dpop_nonce"` from a resource server, is retried once with the nonce the response gave, and the latest nonce per origin is sent on the next proof.
+
+`rp.ResourceRequest(method, url, headers, body, accessToken)` calls a resource server with the token: `Authorization: DPoP` and a proof carrying `ath` when DPoP is in use, `Authorization: Bearer` otherwise. `rp.UserInfo` uses it. `SignalsReceiver.New(...).WithRelyingParty(rp)` calls the SSF transmitter with the relying party's client-credentials token for `ssf.manage` through the same path, so every transmitter call carries a proof when the token is DPoP-bound. `rp.UsesDpop` and `rp.DpopSigner` say whether and with which key.
+
+### Session token cache
+
+`rp.Complete(query, request, sessionId)` keeps the sign-in's tokens in `rp.SessionStore` under `sessionId`, or under a new handle when none is given (`login.SessionId` either way). `rp.SessionAccessToken(sessionId)` returns a valid access token: the cached one while it has more than 30 seconds left, otherwise one obtained with the refresh token (with a DPoP proof when DPoP is in use), and the cache is updated. An unknown session, an expired one with no refresh token, or a failed refresh removes the entry and throws `OidcError` with code `session`. `rp.RemoveSession(sessionId)` clears an entry; a receiver built `WithRelyingParty(rp)` also clears the entries of sessions it ends (a CAEP `session-revoked`) and of `Untrack`. The default store is `MemorySessionTokenStore`; set `rp.SessionStore` to an `ISessionTokenStore` of your own for a store shared across processes.
 
 ## The iya-sts trust chain (`tlsCa`)
 
@@ -54,7 +82,7 @@ The stub tests do not start iya-sts. `python3 scripts/live_iya_sts.py` does, unl
 docker compose up --build
 ```
 
-`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. `GET /live-status` is JSON for the sign-in and the Shared Signals events this process has accepted. It does not include tokens. The demo and the test stub provider pick handlers from a table keyed by method and path, not an if-chain on the request (CodeQL cs/user-controlled-bypass). A page never shows an exception message: the demo logs it and the page says the reason is in the log; a refused sign-in shows only the library error code (CodeQL cs/information-exposure-through-exception).
+`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. `GET /live-status` is JSON for the sign-in and the Shared Signals events this process has accepted. It does not include tokens. It also says whether the relying party uses DPoP (`dpop`). The demo's local session id is the key of the library's session token cache: `/callback` passes it to `Complete`, `GET /` calls `SessionAccessToken` and then `UserInfo` with that token (a `session` refusal ends the local session), sign-out calls `RemoveSession`, and the receiver is built `WithRelyingParty`, so its transmitter calls are DPoP-aware. `scripts/configure_iya_sts.py` registers the client with `oauthIdTokenSignedResponseAlg: RS256` (iya-sts's name for `id_token_signed_response_alg`). The demo and the test stub provider pick handlers from a table keyed by method and path, not an if-chain on the request (CodeQL cs/user-controlled-bypass). A page never shows an exception message: the demo logs it and the page says the reason is in the log; a refused sign-in shows only the library error code (CodeQL cs/information-exposure-through-exception).
 
 A loopback redirect follows `PORT` in the running server and in `scripts/configure_iya_sts.py`. Any other host is left as written. An explicit `--public-url` or a non-empty `PUBLIC_URL` replaces the origin and keeps the path. The running container's `PORT` wins over the shell's when the script registers the application. `pollIntervalMs` is a millisecond pause, not a port.
 

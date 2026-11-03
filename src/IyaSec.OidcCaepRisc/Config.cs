@@ -117,8 +117,8 @@ public static class Config
         if (!string.IsNullOrEmpty(privateKeyPem)) output["privateKeyPem"] = privateKeyPem;
         output["privateKeyAlg"] = Truthy(doc.GetValueOrDefault("privateKeyAlg")) ? doc["privateKeyAlg"] : "RS256";
         output["tokenEndpointAuthMethod"] = method;
-        output["redirectUri"] = CheckRedirect(redirectUri, "redirectUri", allowInsecure);
-        if (postLogout.Length > 0) output["postLogoutRedirectUri"] = CheckRedirect(postLogout, "postLogoutRedirectUri", allowInsecure);
+        output["redirectUri"] = CheckRedirect(redirectUri, "redirectUri");
+        if (postLogout.Length > 0) output["postLogoutRedirectUri"] = CheckRedirect(postLogout, "postLogoutRedirectUri");
         output["scopes"] = scopes;
         if (Truthy(doc.GetValueOrDefault("idTokenSignedResponseAlg"))) output["idTokenSignedResponseAlg"] = doc["idTokenSignedResponseAlg"];
         output["par"] = par;
@@ -128,7 +128,122 @@ public static class Config
         if (!string.IsNullOrEmpty(tlsCa)) output["tlsCa"] = tlsCa;
         if (!signals) output["signals"] = false;
         if (ssf != null) output["ssf"] = ssf;
+        foreach (var name in new[] { "dpop", "idTokenSigningAlgs", "requireIdTokenTypAndAtHash", "acrValues" })
+        {
+            if (doc.TryGetValue(name, out var value) && value != null) output[name] = value;
+        }
+        if (Truthy(doc.GetValueOrDefault("dpopKey"))) output["dpopKey"] = KeyValue(Convert.ToString(doc["dpopKey"])!, baseDir, "the DPoP key");
+        return ApplyDefaults(output);
+    }
+
+    /// <summary>The ID token signing algorithms accepted when <c>idTokenSigningAlgs</c> is not set.</summary>
+    public static readonly IReadOnlyList<string> DefaultIdTokenSigningAlgs = new[] { "RS256" };
+
+    /// <summary>
+    /// The defaults and checks every way of creating a relying party shares, whether the
+    /// configuration came from a file (<see cref="ResolveConfig"/>) or was built in code and given to
+    /// <see cref="RelyingParty.Create"/>: <c>par</c> and <c>dpop</c> (<c>auto</c>),
+    /// <c>clockToleranceSec</c> (30), <c>maxIdTokenAgeSec</c> (600), <c>idTokenSigningAlgs</c>
+    /// (<c>["RS256"]</c>), <c>requireIdTokenTypAndAtHash</c> (true), and the redirect-URI rule
+    /// (https, or http on a loopback host). Returns a new dictionary; the argument is not changed.
+    /// </summary>
+    public static Dictionary<string, object?> ApplyDefaults(IReadOnlyDictionary<string, object?> config)
+    {
+        var output = new Dictionary<string, object?>();
+        foreach (var entry in config) output[entry.Key] = entry.Value;
+        var clientId = Text(output.GetValueOrDefault("clientId")).Trim();
+        if (clientId.Length == 0) throw new OidcError("config", "client_id is required");
+        output["clientId"] = clientId;
+        var methodRaw = output.GetValueOrDefault("tokenEndpointAuthMethod");
+        var method = methodRaw == null || Text(methodRaw).Length == 0 ? "client_secret_basic" : Text(methodRaw);
+        if (method == "none")
+        {
+            throw new OidcError("config", "tokenEndpointAuthMethod \"none\" is a public client; this library authenticates a confidential client");
+        }
+        if (!AuthMethods.Contains(method))
+        {
+            throw new OidcError("config", "tokenEndpointAuthMethod must be " + string.Join(", ", AuthMethods) + ", not " + method);
+        }
+        output["tokenEndpointAuthMethod"] = method;
+        var allowInsecure = output.GetValueOrDefault("allowInsecure") is true;
+        output["allowInsecure"] = allowInsecure;
+        var redirectUri = Text(output.GetValueOrDefault("redirectUri")).Trim();
+        if (redirectUri.Length == 0) throw new OidcError("config", "redirectUri is required");
+        output["redirectUri"] = CheckRedirect(redirectUri, "redirectUri");
+        var postLogout = Text(output.GetValueOrDefault("postLogoutRedirectUri")).Trim();
+        if (postLogout.Length > 0) output["postLogoutRedirectUri"] = CheckRedirect(postLogout, "postLogoutRedirectUri");
+        else output.Remove("postLogoutRedirectUri");
+        string scopes;
+        if (output.GetValueOrDefault("scopes") == null) scopes = Discovery.DefaultScopes.Trim();
+        else if (Jsons.List(output["scopes"]) is { } items) scopes = JoinScopes(items);
+        else scopes = Text(output["scopes"]).Trim();
+        if (!scopes.Split(' ').Contains("openid")) throw new OidcError("config", "scopes must include openid");
+        output["scopes"] = scopes;
+        output["par"] = Mode(output.GetValueOrDefault("par"), "par");
+        output["dpop"] = Mode(output.GetValueOrDefault("dpop"), "dpop");
+        if (!Truthy(output.GetValueOrDefault("dpopKey"))) output.Remove("dpopKey");
+        else if (output["dpopKey"] is not string) throw new OidcError("config", "dpopKey must be a PEM private key");
+        output["clockToleranceSec"] = Seconds(output.GetValueOrDefault("clockToleranceSec"), 30, "clockToleranceSec");
+        output["maxIdTokenAgeSec"] = Seconds(output.GetValueOrDefault("maxIdTokenAgeSec"), 600, "maxIdTokenAgeSec");
+        if (Truthy(output.GetValueOrDefault("idTokenSignedResponseAlg")))
+        {
+            var pinned = Text(output["idTokenSignedResponseAlg"]).Trim();
+            if (pinned.Equals("none", StringComparison.OrdinalIgnoreCase)) throw new OidcError("config", "idTokenSignedResponseAlg must not be none");
+            output["idTokenSignedResponseAlg"] = pinned;
+        }
+        else
+        {
+            output.Remove("idTokenSignedResponseAlg");
+        }
+        output["idTokenSigningAlgs"] = Algorithms(output.GetValueOrDefault("idTokenSigningAlgs"));
+        var require = output.GetValueOrDefault("requireIdTokenTypAndAtHash");
+        if (require == null) output["requireIdTokenTypAndAtHash"] = true;
+        else if (require is not bool) throw new OidcError("config", "requireIdTokenTypAndAtHash must be true or false");
+        var acr = output.GetValueOrDefault("acrValues");
+        var acrText = acr == null ? "" : Jsons.List(acr) is { } acrItems ? JoinScopes(acrItems) : Text(acr).Trim();
+        if (acrText.Length > 0) output["acrValues"] = acrText;
+        else output.Remove("acrValues");
+        if (!Truthy(output.GetValueOrDefault("privateKeyAlg"))) output["privateKeyAlg"] = "RS256";
         return output;
+    }
+
+    /// <summary>
+    /// Checks a redirect URI (the configured one, a post-logout one, or a per-request override):
+    /// https, or http on a loopback host (<c>localhost</c>, <c>127.0.0.1</c>, <c>[::1]</c>).
+    /// <c>allowInsecure</c> does not relax this rule; it only lets the provider's own endpoints use http.
+    /// </summary>
+    public static string CheckRedirectUri(string value, string name) => CheckRedirect(value, name);
+
+    static string Mode(object? value, string name)
+    {
+        var text = value == null ? "auto" : Text(value);
+        if (text != "auto" && text != "always" && text != "never") throw new OidcError("config", name + " must be auto, always, or never");
+        return text;
+    }
+
+    static object Seconds(object? value, long fallback, string name)
+    {
+        if (value == null) return fallback;
+        if (value is not (byte or short or int or long or float or double or decimal) || AsDouble(value) < 0)
+        {
+            throw new OidcError("config", name + " must be a number of seconds");
+        }
+        return value;
+    }
+
+    static List<object?> Algorithms(object? value)
+    {
+        List<string> names;
+        if (value == null) names = new List<string>(DefaultIdTokenSigningAlgs);
+        else if (Jsons.List(value) is { } items) names = items.Select(item => Text(item).Trim()).Where(item => item.Length > 0).ToList();
+        else if (value is string text) names = text.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+        else throw new OidcError("config", "idTokenSigningAlgs must be a list of algorithm names");
+        if (names.Count == 0) throw new OidcError("config", "idTokenSigningAlgs must name at least one algorithm");
+        foreach (var name in names)
+        {
+            if (name.Equals("none", StringComparison.OrdinalIgnoreCase)) throw new OidcError("config", "idTokenSigningAlgs must not include none");
+        }
+        return names.Distinct().Cast<object?>().ToList();
     }
 
     static bool SignalsOn(object? value)
@@ -201,14 +316,14 @@ public static class Config
         }
     }
 
-    static string CheckRedirect(string value, string name, bool allowInsecure)
+    static string CheckRedirect(string value, string name)
     {
         if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || (uri.Scheme != "http" && uri.Scheme != "https") || string.IsNullOrEmpty(uri.Host))
         {
             throw new OidcError("config", name + " is not a URL: " + value);
         }
         if (uri.Scheme == "https") return value;
-        if (uri.Scheme == "http" && (Loopback(uri.Host) || allowInsecure)) return value;
+        if (uri.Scheme == "http" && Loopback(uri.Host)) return value;
         throw new OidcError("config", name + " must use https, or http on loopback: " + value);
     }
 

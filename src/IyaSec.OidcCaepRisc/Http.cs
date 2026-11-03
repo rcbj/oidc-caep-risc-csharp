@@ -16,7 +16,12 @@ public static class Http
 
     static readonly HttpClient Plain = Build(null);
 
-    public readonly record struct Result(int Status, string ContentType, string Body);
+    /// <summary>A response: its status, content type, body, and headers (names compared without case).</summary>
+    public readonly record struct Result(int Status, string ContentType, string Body, IReadOnlyDictionary<string, string>? Headers = null)
+    {
+        /// <summary>One response header, or null when the response did not carry it.</summary>
+        public string? Header(string name) => Headers != null && Headers.TryGetValue(name, out var value) ? value : null;
+    }
 
     public static Result Send(string url, string method, IReadOnlyDictionary<string, string>? headers, byte[]? body, IReadOnlyDictionary<string, string>? tls, string code)
     {
@@ -57,7 +62,9 @@ public static class Http
             using var response = client.Send(request, HttpCompletionOption.ResponseHeadersRead);
             var raw = ReadLimited(response, url, code);
             var contentType = response.Content.Headers.ContentType?.ToString() ?? "";
-            return new Result((int)response.StatusCode, contentType, Encoding.UTF8.GetString(raw));
+            var named = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var header in response.Headers) named[header.Key] = string.Join(", ", header.Value);
+            return new Result((int)response.StatusCode, contentType, Encoding.UTF8.GetString(raw), named);
         }
         catch (OidcError)
         {

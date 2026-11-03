@@ -296,7 +296,7 @@ sealed class DemoApp
 
     void Home(HttpListenerContext context)
     {
-        var (_, sess) = SessionOf(context.Request);
+        var (sid, sess) = SessionOf(context.Request);
         string problem = "";
         RelyingParty? party;
         try
@@ -308,6 +308,34 @@ sealed class DemoApp
             party = null;
             Console.Error.WriteLine("demo: the relying party is not configured: " + err);
             problem = "The relying party is not configured yet. Run scripts/configure_iya_sts.py. " + Logged;
+        }
+        var tokens = "";
+        if (sess?.Login != null && party != null)
+        {
+            // The library's session token cache: a valid access token for this session (refreshed,
+            // with a DPoP proof when DPoP is in use, once it has 30 seconds or less left), then a
+            // UserInfo call with it (DPoP-bound when the token is). A refusal ends the local session.
+            try
+            {
+                var access = party.SessionAccessToken(sid);
+                tokens = "access token valid (" + (party.UsesDpop ? "DPoP-bound" : "Bearer") + ")";
+                try
+                {
+                    party.UserInfo(access, sess.Login.Subject);
+                    tokens += "; UserInfo answered for this subject";
+                }
+                catch (Exception err)
+                {
+                    Console.Error.WriteLine("demo: userinfo: " + err);
+                    tokens += "; UserInfo failed. " + Logged;
+                }
+            }
+            catch (OidcError err) when (err.Code == "session")
+            {
+                Console.Error.WriteLine("demo: the session's tokens were refused: " + err);
+                EndSession(sid);
+                sess = null;
+            }
         }
         if (sess?.Login != null)
         {
@@ -329,7 +357,8 @@ sealed class DemoApp
                 rows += "<tr><th>" + Web(row.Item1) + "</th><td>" + Web(row.Item2) + "</td></tr>";
             }
             var body = "<h1>Signed in as " + Web(who ?? "") + "</h1><table class=\"facts\">" + rows
-                + "</table><p><small>The access token and the refresh token stay in this process. This page does not show them.</small></p><p><small>Shared Signals: "
+                + "</table><p><small>The access token and the refresh token stay in this process. This page does not show them."
+                + (tokens.Length == 0 ? "" : " Tokens: " + Web(tokens) + ".") + "</small></p><p><small>Shared Signals: "
                 + Web(State()) + "</small></p><form method=\"post\" action=\"/logout\"><button type=\"submit\">Sign out</button></form>";
             Send(context.Response, 200, Page("Signed in", body), "text/html; charset=utf-8", null);
             return;
@@ -368,9 +397,12 @@ sealed class DemoApp
             events = liveEvents.Select(item => new Dictionary<string, object?> { ["type"] = item.Type, ["jti"] = item.Jti }).ToList();
             state = receiverState;
         }
+        bool? dpop;
+        lock (gate) dpop = loaded && rp != null ? rp.UsesDpop : null;
         var body = JsonSerializer.Serialize(new Dictionary<string, object?>
         {
             ["signedIn"] = sess?.Login != null,
+            ["dpop"] = dpop,
             ["subject"] = subject,
             ["receiver"] = state,
             ["events"] = events,
@@ -427,6 +459,7 @@ sealed class DemoApp
             ["nonce"] = request.Nonce ?? "",
             ["code_verifier"] = request.CodeVerifier ?? "",
             ["redirect_uri"] = request.RedirectUri ?? "",
+            ["acr_values"] = request.AcrValues ?? "",
         };
         Redirect(context.Response, 302, request.Url ?? "/", new[] { Cookie(CookieTxn, Seal(txn), "/callback", 600) });
     }
@@ -465,11 +498,14 @@ sealed class DemoApp
             Nonce = txn.GetValueOrDefault("nonce"),
             CodeVerifier = txn.GetValueOrDefault("code_verifier"),
             RedirectUri = txn.GetValueOrDefault("redirect_uri"),
+            AcrValues = string.IsNullOrEmpty(txn.GetValueOrDefault("acr_values")) ? null : txn["acr_values"],
         };
+        // The local session id is also the key of the library's session token cache.
+        var sid = Codec.RandomToken();
         RelyingParty.Login login;
         try
         {
-            login = party.Complete(query, request);
+            login = party.Complete(query, request, sid);
         }
         catch (Exception err)
         {
@@ -488,7 +524,6 @@ sealed class DemoApp
             Failed(context, 400, "Sign-in failed", "sign-in refused", err, new[] { clear }, kind + ". " + Logged);
             return;
         }
-        var sid = Codec.RandomToken();
         SignalsReceiver? current;
         lock (gate)
         {
@@ -502,17 +537,24 @@ sealed class DemoApp
     void Logout(HttpListenerContext context)
     {
         var (sid, _) = SessionOf(context.Request);
-        if (sid.Length > 0)
-        {
-            SignalsReceiver? current;
-            lock (gate)
-            {
-                sessions.Remove(sid);
-                current = receiver;
-            }
-            current?.Untrack(sid);
-        }
+        if (sid.Length > 0) EndSession(sid);
         Redirect(context.Response, 303, "/", new[] { Cookie(CookieSession, "", "/", 0) });
+    }
+
+    // Ends a local session: the demo's own record, the receiver's tracking, and the library's
+    // cached tokens.
+    void EndSession(string sid)
+    {
+        SignalsReceiver? current;
+        RelyingParty? party;
+        lock (gate)
+        {
+            sessions.Remove(sid);
+            current = receiver;
+            party = rp;
+        }
+        current?.Untrack(sid);
+        party?.RemoveSession(sid);
     }
 
     RelyingParty Open()
@@ -591,7 +633,7 @@ sealed class DemoApp
                 }
             })
                 .WithTls(party.Tls())
-                .WithHeaders(() => SignalHeaders(party))
+                .WithRelyingParty(party, "ssf.manage")
                 .WithDescription("oidc-caep-risc-csharp demo (" + Sprint(cfg.GetValueOrDefault("clientId")) + ")")
                 .WithPollIntervalMs(interval)
                 .Build();
@@ -617,19 +659,6 @@ sealed class DemoApp
         }
         var streamId = built.Stream == null ? "" : Sprint(built.Stream.GetValueOrDefault("stream_id"));
         receiverState = "polling stream " + streamId + " at " + transmitter;
-    }
-
-    Dictionary<string, string> SignalHeaders(RelyingParty party)
-    {
-        try
-        {
-            var access = party.ClientCredentials("ssf.manage");
-            return new Dictionary<string, string> { ["authorization"] = "Bearer " + access.AccessToken };
-        }
-        catch (Exception)
-        {
-            return new Dictionary<string, string>();
-        }
     }
 
     string State()

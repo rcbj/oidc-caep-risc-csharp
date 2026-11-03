@@ -48,7 +48,7 @@ public static class Discovery
         {
             if (doc.TryGetValue(key, out var value) && value != null) metadata[key] = MustBeUrl(value, key);
         }
-        foreach (var key in new[] { "token_endpoint_auth_methods_supported", "code_challenge_methods_supported", "scopes_supported", "grant_types_supported" })
+        foreach (var key in new[] { "token_endpoint_auth_methods_supported", "code_challenge_methods_supported", "scopes_supported", "grant_types_supported", "dpop_signing_alg_values_supported" })
         {
             if (doc.TryGetValue(key, out var value) && value != null)
             {
@@ -59,6 +59,10 @@ public static class Discovery
         if (doc.TryGetValue("authorization_response_iss_parameter_supported", out var issParam) && issParam != null)
         {
             metadata["authorization_response_iss_parameter_supported"] = issParam is true;
+        }
+        if (doc.TryGetValue("require_pushed_authorization_requests", out var requirePar) && requirePar != null)
+        {
+            metadata["require_pushed_authorization_requests"] = requirePar is true;
         }
         var responseTypes = Jsons.List(metadata["response_types_supported"]);
         var responseNames = responseTypes == null ? new List<string>() : Strings(responseTypes);
@@ -106,18 +110,35 @@ public static class Discovery
         return new List<string> { inserted, appended };
     }
 
-    public static List<string> IdTokenAlgorithms(IEnumerable<object?>? advertised, string? pinned)
+    /// <summary>
+    /// The ID token signing algorithms this client accepts: the pinned one when
+    /// <paramref name="pinned"/> is set, otherwise the allow-list (<c>["RS256"]</c> by default),
+    /// in either case only those the provider also advertises. <c>none</c> is never accepted, a
+    /// symmetric algorithm only when it is named, and an algorithm this runtime cannot verify is
+    /// refused.
+    /// </summary>
+    public static List<string> IdTokenAlgorithms(IEnumerable<object?>? advertised, string? pinned, IEnumerable<string>? allowList = null)
     {
         var names = advertised?.Select(item => Convert.ToString(item) ?? "").ToList() ?? new List<string>();
+        var wanted = !string.IsNullOrEmpty(pinned)
+            ? new List<string> { pinned }
+            : (allowList ?? Config.DefaultIdTokenSigningAlgs).ToList();
+        foreach (var alg in wanted)
+        {
+            if (alg.Equals("none", StringComparison.OrdinalIgnoreCase)) throw new OidcError("config", "the ID token algorithm none is never accepted");
+            var spec = JwsCrypto.Alg(alg);
+            if (spec == null || spec[2] == "eddsa") throw new OidcError("config", "this library cannot verify ID tokens signed with " + alg);
+        }
         if (!string.IsNullOrEmpty(pinned))
         {
             if (!names.Contains(pinned)) throw new OidcError("discovery", "the provider does not advertise id_token alg " + pinned);
             return new List<string> { pinned };
         }
-        var allowed = names.Where(alg => AsymmetricJwsAlgs.Contains(alg)).ToList();
+        var allowed = wanted.Where(names.Contains).ToList();
         if (allowed.Count == 0)
         {
-            throw new OidcError("discovery", "none of the provider's ID token algorithms can be verified (" + string.Join(", ", names) + ")");
+            throw new OidcError("discovery", "the provider advertises none of the accepted ID token algorithms (" + string.Join(", ", wanted)
+                + "); it advertises " + string.Join(", ", names) + ". idTokenSigningAlgs widens the list");
         }
         return allowed;
     }

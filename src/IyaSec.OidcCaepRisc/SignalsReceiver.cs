@@ -15,6 +15,9 @@ public sealed class SignalsReceiver
     readonly string transmitter;
     readonly Action<IReadOnlyList<string>, Dictionary<string, object?>> onEnd;
     readonly Dictionary<string, string> tls;
+    readonly bool tlsGiven;
+    readonly RelyingParty? party;
+    readonly string partyScope;
     readonly Func<IReadOnlyDictionary<string, string>>? headers;
     readonly List<string> eventsRequested;
     readonly List<string> endOn;
@@ -45,7 +48,10 @@ public sealed class SignalsReceiver
         }
         transmitter = builder.Transmitter.TrimEnd('/');
         onEnd = builder.OnEnd;
-        tls = builder.Tls ?? new Dictionary<string, string>();
+        party = builder.Party;
+        partyScope = builder.PartyScope;
+        tlsGiven = builder.Tls != null;
+        tls = builder.Tls ?? party?.Tls() ?? new Dictionary<string, string>();
         headers = builder.Headers;
         eventsRequested = new List<string>(builder.EventsRequested ?? Events.DefaultEventsRequested);
         endOn = new List<string>(builder.EndOn ?? Events.DefaultEndingEvents);
@@ -62,7 +68,12 @@ public sealed class SignalsReceiver
 
     public void Track(IReadOnlyDictionary<string, object?> session) => index.Add(session);
 
-    public void Untrack(string localId) => index.Remove(localId);
+    /// <summary>Stops tracking a local session (sign-out), and forgets its tokens in the relying party given to <see cref="Builder.WithRelyingParty"/>.</summary>
+    public void Untrack(string localId)
+    {
+        index.Remove(localId);
+        party?.RemoveSession(localId);
+    }
 
     public SignalsReceiver On(string eventType, Action<Dictionary<string, object?>> handler)
     {
@@ -274,7 +285,14 @@ public sealed class SignalsReceiver
                     signal["ended"] = false;
                     ends = false;
                 }
-                if (signal.GetValueOrDefault("ended") is true) foreach (var localId in sessions) index.Remove(localId);
+                if (signal.GetValueOrDefault("ended") is true)
+                {
+                    foreach (var localId in sessions)
+                    {
+                        index.Remove(localId);
+                        party?.RemoveSession(localId);
+                    }
+                }
             }
             var called = new List<Action<Dictionary<string, object?>>>();
             if (handlers.TryGetValue(eventType, out var typed)) called.AddRange(typed);
@@ -406,7 +424,19 @@ public sealed class SignalsReceiver
             requestHeaders["content-type"] = "application/json";
             payload = Encoding.UTF8.GetBytes(Jsons.Write(body));
         }
-        var answer = Http.Send(url, method, requestHeaders, payload, tls, "ssf");
+        Http.Result answer;
+        if (party != null)
+        {
+            // The relying party's client-credentials token, DPoP-bound when it uses DPoP: every call
+            // to the transmitter then carries a proof (with ath), and a use_dpop_nonce 401 is
+            // retried once with the nonce.
+            var token = party.ClientCredentials(partyScope).AccessToken;
+            answer = party.ResourceRequest(method, url, requestHeaders, payload, token, "ssf", tlsGiven ? tls : null);
+        }
+        else
+        {
+            answer = Http.Send(url, method, requestHeaders, payload, tls, "ssf");
+        }
         object? parsed = null;
         if (!string.IsNullOrEmpty(answer.Body))
         {
@@ -476,6 +506,8 @@ public sealed class SignalsReceiver
         internal long PollIntervalMs { get; private set; } = 5000;
         internal int MaxEvents { get; private set; } = 50;
         internal Log? Logger { get; private set; }
+        internal RelyingParty? Party { get; private set; }
+        internal string PartyScope { get; private set; } = "ssf.manage";
 
         internal Builder(string transmitter, Action<IReadOnlyList<string>, Dictionary<string, object?>> onEnd)
         {
@@ -492,6 +524,20 @@ public sealed class SignalsReceiver
         public Builder WithPollIntervalMs(long value) { PollIntervalMs = value <= 0 ? 5000 : value; return this; }
         public Builder WithMaxEvents(int value) { MaxEvents = value <= 0 ? 50 : value; return this; }
         public Builder WithLog(Log value) { Logger = value; return this; }
+
+        /// <summary>
+        /// Calls the transmitter with the relying party's client-credentials token for
+        /// <paramref name="scope"/>, with a DPoP proof on every call when the relying party uses
+        /// DPoP. The relying party's <c>tlsCa</c> is used unless <see cref="WithTls"/> sets
+        /// another. A session the receiver ends, or <see cref="SignalsReceiver.Untrack"/> removes,
+        /// is also removed from the relying party's session token cache.
+        /// </summary>
+        public Builder WithRelyingParty(RelyingParty value, string scope = "ssf.manage")
+        {
+            Party = value;
+            PartyScope = string.IsNullOrEmpty(scope) ? "ssf.manage" : scope;
+            return this;
+        }
         public SignalsReceiver Build() => new(this);
     }
 }

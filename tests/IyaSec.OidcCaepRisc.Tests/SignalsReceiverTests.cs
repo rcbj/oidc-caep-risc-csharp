@@ -68,7 +68,29 @@ public sealed class TransmitterFixture : IDisposable
         var text = reader.ReadToEnd();
         Stub.Authorization = exchange.Request.Headers["Authorization"] ?? "";
         var path = exchange.Request.Url!.AbsolutePath;
-        if (Stub.Authorization != "Bearer app-token" && path != "/.well-known/ssf-configuration" && !path.StartsWith("/jwks", StringComparison.Ordinal))
+        if (Stub.DpopToken != null)
+        {
+            // DPoP mode: every call, discovery and keys included, must carry the DPoP-bound token
+            // and a proof for this method and URL with ath; Nonce, when set, must be in the proof.
+            var proof = exchange.Request.Headers["DPoP"];
+            var check = proof == null ? null : DpopProof.Check(proof, exchange.Request.HttpMethod, Stub.BaseUrl + path, Stub.DpopToken);
+            if (Stub.Authorization != "DPoP " + Stub.DpopToken || check == null || check.Error != null)
+            {
+                lock (Stub.ProofErrors) Stub.ProofErrors.Add(path + ": " + (check?.Error ?? "no proof or wrong scheme: " + Stub.Authorization));
+                ProviderFixture.Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "invalid_token" });
+                return;
+            }
+            if (Stub.Nonce != null && check.Nonce != Stub.Nonce)
+            {
+                Interlocked.Increment(ref Stub.Challenges);
+                exchange.Response.AddHeader("WWW-Authenticate", "DPoP error=\"use_dpop_nonce\"");
+                exchange.Response.AddHeader("DPoP-Nonce", Stub.Nonce);
+                ProviderFixture.Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "use_dpop_nonce" });
+                return;
+            }
+            Interlocked.Increment(ref Stub.Proofs);
+        }
+        else if (Stub.Authorization != "Bearer app-token" && path != "/.well-known/ssf-configuration" && !path.StartsWith("/jwks", StringComparison.Ordinal))
         {
             ProviderFixture.Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "invalid_token" });
             return;
@@ -182,6 +204,11 @@ public sealed class TransmitterFixture : IDisposable
         public readonly List<Dictionary<string, object?>> Streams = new();
         public string VerifyState = "";
         public int VerifyStatus;
+        public string? DpopToken;
+        public string? Nonce;
+        public int Challenges;
+        public int Proofs;
+        public readonly List<string> ProofErrors = new();
     }
 }
 
