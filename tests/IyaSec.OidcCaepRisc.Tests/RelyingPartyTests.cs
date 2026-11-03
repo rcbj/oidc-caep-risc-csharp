@@ -111,7 +111,33 @@ public sealed class ProviderFixture : IDisposable
     void UserInfo(HttpListenerContext exchange, string text)
     {
         var header = exchange.Request.Headers["Authorization"] ?? "";
-        var token = header.StartsWith("Bearer ", StringComparison.Ordinal) ? header[7..].Trim() : "";
+        var dpop = header.StartsWith("DPoP ", StringComparison.Ordinal);
+        var token = header.StartsWith("Bearer ", StringComparison.Ordinal) || dpop ? header[(header.IndexOf(' ') + 1)..].Trim() : "";
+        // A DPoP-bound token must arrive as DPoP, with a proof by the bound key that carries ath.
+        if (State.Bound.TryGetValue(token, out var bound))
+        {
+            var proof = exchange.Request.Headers["DPoP"];
+            var check = proof == null ? null : DpopProof.Check(proof, "GET", State.Url + "/userinfo", token);
+            if (!dpop || check == null || check.Error != null || check.Jkt != bound)
+            {
+                State.ProofErrors.Add("userinfo: " + (check?.Error ?? "no proof or wrong scheme"));
+                Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "invalid_token" });
+                return;
+            }
+            if (State.ResourceNonce != null && check.Nonce != State.ResourceNonce)
+            {
+                State.ResourceChallenges += 1;
+                exchange.Response.AddHeader("WWW-Authenticate", "DPoP error=\"use_dpop_nonce\", error_description=\"Resource server requires nonce in DPoP proof\"");
+                exchange.Response.AddHeader("DPoP-Nonce", State.ResourceNonce);
+                Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "use_dpop_nonce" });
+                return;
+            }
+            State.UserInfoProofs += 1;
+        }
+        else if (dpop)
+        {
+            token = "";
+        }
         State.Access.TryGetValue(token, out var claims);
         Json(exchange, claims == null ? 401 : 200, claims ?? new Dictionary<string, object?> { ["error"] = "invalid_token" });
     }
@@ -119,6 +145,18 @@ public sealed class ProviderFixture : IDisposable
     void Par(HttpListenerContext exchange, string text)
     {
         if (!Authorized(exchange, text)) { Json(exchange, 401, new Dictionary<string, object?> { ["error"] = "invalid_client" }); return; }
+        var proof = exchange.Request.Headers["DPoP"];
+        if (proof != null)
+        {
+            var check = DpopProof.Check(proof, "POST", State.Url + "/par", null);
+            if (check.Error != null)
+            {
+                State.ProofErrors.Add("par: " + check.Error);
+                Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_dpop_proof" });
+                return;
+            }
+            State.ParProofs += 1;
+        }
         var requestUri = "urn:par:" + Guid.NewGuid().ToString("N");
         State.Pushed[requestUri] = Form(text);
         Json(exchange, 201, new Dictionary<string, object?> { ["request_uri"] = requestUri, ["expires_in"] = 60 });
@@ -128,6 +166,8 @@ public sealed class ProviderFixture : IDisposable
     {
         var query = Form(exchange.Request.Url!.Query.TrimStart('?'));
         var stored = query.GetValueOrDefault("request_uri");
+        State.LastAuthorize = query;
+        if (State.RequirePar && stored == null) { Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_request" }); return; }
         var parameters = stored == null ? query : State.Pushed.GetValueOrDefault(stored);
         if (parameters == null) { Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_request" }); return; }
         var redirect = parameters.GetValueOrDefault("redirect_uri") ?? "";
@@ -142,7 +182,9 @@ public sealed class ProviderFixture : IDisposable
         {
             ["sub"] = "user-1", ["email"] = "user-1@example.com", ["sid"] = "sid-1",
             ["nonce"] = parameters.GetValueOrDefault("nonce") ?? "", ["redirect"] = redirect, ["challenge"] = challenge,
+            ["dpop_jkt"] = parameters.GetValueOrDefault("dpop_jkt") ?? "",
         };
+        State.LastParameters = parameters;
         var code = Guid.NewGuid().ToString("N");
         State.Codes[code] = row;
         var back = new Uri(redirect);
@@ -164,9 +206,33 @@ public sealed class ProviderFixture : IDisposable
         }
         var parameters = Form(text);
         var grant = parameters.GetValueOrDefault("grant_type") ?? "";
+        State.TokenCalls += 1;
+        string? jkt = null;
+        var proof = exchange.Request.Headers["DPoP"];
+        if (proof != null)
+        {
+            var check = DpopProof.Check(proof, "POST", State.Url + "/token", null);
+            if (check.Error != null)
+            {
+                State.ProofErrors.Add("token: " + check.Error);
+                Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_dpop_proof", ["error_description"] = check.Error });
+                return;
+            }
+            if (State.TokenNonce != null && check.Nonce != State.TokenNonce)
+            {
+                State.TokenChallenges += 1;
+                exchange.Response.AddHeader("DPoP-Nonce", State.TokenNonce);
+                Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "use_dpop_nonce", ["error_description"] = "Authorization server requires nonce in DPoP proof" });
+                return;
+            }
+            jkt = check.Jkt;
+            State.TokenProofs.Add(grant);
+        }
+        State.Jkt = jkt;
         if (grant == "client_credentials")
         {
-            Json(exchange, 200, new Dictionary<string, object?> { ["access_token"] = "cc-token", ["token_type"] = "Bearer", ["expires_in"] = 120, ["scope"] = parameters.GetValueOrDefault("scope") ?? "" });
+            if (jkt != null) State.Bound["cc-token"] = jkt;
+            Json(exchange, 200, new Dictionary<string, object?> { ["access_token"] = "cc-token", ["token_type"] = State.ForceTokenType ?? (jkt != null ? "DPoP" : "Bearer"), ["expires_in"] = 120, ["scope"] = parameters.GetValueOrDefault("scope") ?? "" });
             return;
         }
         if (grant == "refresh_token")
@@ -196,6 +262,11 @@ public sealed class ProviderFixture : IDisposable
             Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_grant", ["error_description"] = "pkce" });
             return;
         }
+        if (saved.GetValueOrDefault("dpop_jkt") is { Length: > 0 } wanted && wanted != jkt)
+        {
+            Json(exchange, 400, new Dictionary<string, object?> { ["error"] = "invalid_dpop_proof", ["error_description"] = "dpop_jkt" });
+            return;
+        }
         State.Codes.Remove(code);
         Json(exchange, 200, TokenFor(saved));
     }
@@ -219,6 +290,9 @@ public sealed class ProviderFixture : IDisposable
             ["scopes_supported"] = Scopes.Split(' ').Cast<object?>().ToList(),
         };
         if (State.Par) doc["pushed_authorization_request_endpoint"] = State.Url + "/par";
+        if (State.RequirePar) doc["require_pushed_authorization_requests"] = true;
+        if (State.DpopAlgs != null) doc["dpop_signing_alg_values_supported"] = State.DpopAlgs;
+        if (State.IdAlgs != null) doc["id_token_signing_alg_values_supported"] = State.IdAlgs;
         return doc;
     }
 
@@ -230,10 +304,13 @@ public sealed class ProviderFixture : IDisposable
         var payload = new Dictionary<string, object?>
         {
             ["iss"] = State.Url, ["sub"] = row["sub"], ["aud"] = State.Aud,
-            ["exp"] = State.Exp ?? now + 300, ["iat"] = State.Exp ?? now, ["nonce"] = row["nonce"],
+            ["exp"] = State.Exp ?? now + 300, ["iat"] = State.Iat ?? State.Exp ?? now, ["nonce"] = row["nonce"],
             ["email"] = row["email"], ["name"] = "Demo User", ["preferred_username"] = row["sub"], ["sid"] = row["sid"],
-            ["at_hash"] = State.BadAtHash ? "aaaa" : IdToken.HashClaim(access, "RS256"),
+            ["at_hash"] = State.BadAtHash ? "aaaa" : IdToken.HashClaim(access, State.IdAlg),
         };
+        if (State.NoAtHash) payload.Remove("at_hash");
+        if (State.Acr != null) payload["acr"] = State.Acr;
+        if (State.Jkt != null) State.Bound[access] = State.Jkt;
         var token = IdTokenOf(payload, State.Corrupt);
         State.Refresh[refresh] = row;
         State.Access[access] = payload;
@@ -243,16 +320,21 @@ public sealed class ProviderFixture : IDisposable
         State.Exp = null;
         return new Dictionary<string, object?>
         {
-            ["access_token"] = access, ["token_type"] = "Bearer", ["expires_in"] = 300,
+            ["access_token"] = access, ["token_type"] = State.ForceTokenType ?? (State.Jkt != null ? "DPoP" : "Bearer"), ["expires_in"] = State.ExpiresIn,
             ["refresh_token"] = refresh, ["id_token"] = token, ["scope"] = Scopes,
         };
     }
 
     string IdTokenOf(Dictionary<string, object?> payload, bool corrupt)
     {
-        var header = Codec.B64UrlEncode(Encoding.UTF8.GetBytes("{\"alg\":\"RS256\",\"kid\":\"op\",\"typ\":\"JWT\"}"));
+        var fields = new Dictionary<string, object?> { ["alg"] = State.IdAlg, ["kid"] = "op" };
+        if (State.Typ != null) fields["typ"] = State.Typ;
+        if (State.IdAlg.StartsWith("HS", StringComparison.Ordinal)) fields.Remove("kid");
+        var header = Codec.B64UrlEncode(Encoding.UTF8.GetBytes(Jsons.Write(fields)));
         var body = Codec.B64UrlEncode(Encoding.UTF8.GetBytes(Jsons.Write(payload)));
-        var signature = ProviderKeys.SignData(Encoding.ASCII.GetBytes(header + "." + body), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var signature = State.IdAlg.StartsWith("HS", StringComparison.Ordinal)
+            ? HMACSHA256.HashData(Encoding.UTF8.GetBytes(Secret), Encoding.ASCII.GetBytes(header + "." + body))
+            : ProviderKeys.SignData(Encoding.ASCII.GetBytes(header + "." + body), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         var sig = Codec.B64UrlEncode(signature);
         if (corrupt) sig = (sig.StartsWith('A') ? "B" : "A") + sig[1..];
         return header + "." + body + "." + sig;
@@ -343,6 +425,39 @@ public sealed class ProviderFixture : IDisposable
         public readonly Dictionary<string, Dictionary<string, string>> Refresh = new();
         public readonly Dictionary<string, Dictionary<string, object?>> Access = new();
         public readonly Dictionary<string, Dictionary<string, string>> Pushed = new();
+        // Issue #30's knobs. Reset() puts every one back.
+        public bool RequirePar;
+        public List<object?>? DpopAlgs;
+        public List<object?>? IdAlgs;
+        public string IdAlg = "RS256";
+        public string? Typ = "JWT";
+        public bool NoAtHash;
+        public string? Acr;
+        public long? Iat;
+        public int ExpiresIn = 300;
+        public string? ForceTokenType;
+        public string? TokenNonce;
+        public string? ResourceNonce;
+        public string? Jkt;
+        public int TokenCalls;
+        public int TokenChallenges;
+        public int ResourceChallenges;
+        public int ParProofs;
+        public int UserInfoProofs;
+        public readonly List<string> TokenProofs = new();
+        public readonly List<string> ProofErrors = new();
+        public readonly Dictionary<string, string> Bound = new();
+        public Dictionary<string, string>? LastAuthorize;
+        public Dictionary<string, string>? LastParameters;
+
+        public void Reset()
+        {
+            Par = false; Corrupt = false; Aud = Client; Exp = null; BadAtHash = false;
+            RequirePar = false; DpopAlgs = null; IdAlgs = null; IdAlg = "RS256"; Typ = "JWT"; NoAtHash = false;
+            Acr = null; Iat = null; ExpiresIn = 300; ForceTokenType = null; TokenNonce = null; ResourceNonce = null; Jkt = null;
+            TokenCalls = 0; TokenChallenges = 0; ResourceChallenges = 0; ParProofs = 0; UserInfoProofs = 0;
+            TokenProofs.Clear(); ProofErrors.Clear(); LastAuthorize = null; LastParameters = null;
+        }
     }
 }
 

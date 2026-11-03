@@ -40,7 +40,12 @@ public static class IdToken
         {
             throw new OidcError("validation", "the ID token has a crit header this client does not understand");
         }
+        // requireTypAndAtHash (the requireIdTokenTypAndAtHash setting, default true): typ must be
+        // present and at_hash must be present when the token response carried an access token.
+        // False checks each only when present.
+        var strict = checks.GetValueOrDefault("requireTypAndAtHash") is true;
         var typ = header.GetValueOrDefault("typ") == null ? "" : Convert.ToString(header["typ"])!.ToLowerInvariant();
+        if (typ.Length == 0 && strict) throw new OidcError("validation", "the ID token header has no typ");
         if (typ.Length > 0 && ((typ != "jwt" && typ != "application/jwt") || NotIdToken.Contains(typ)))
         {
             throw new OidcError("validation", "the ID token typ is " + header["typ"] + ", not an ID token");
@@ -81,6 +86,10 @@ public static class IdToken
         {
             throw new OidcError("validation", "the ID token was refused: nbf is in the future");
         }
+        if (Number(payload.GetValueOrDefault("iat")) is double issued && issued - tolerance > now)
+        {
+            throw new OidcError("validation", "the ID token was refused: iat is in the future");
+        }
         if (checks.ContainsKey("maxIdTokenAgeSec") && checks.GetValueOrDefault("maxIdTokenAgeSec") != null)
         {
             if (Number(payload.GetValueOrDefault("iat")) is not double iat) throw new OidcError("validation", "the ID token was refused: iat is missing");
@@ -107,8 +116,8 @@ public static class IdToken
         {
             throw new OidcError("validation", "the refreshed ID token is for a different subject");
         }
-        if (Config.Truthy(checks.GetValueOrDefault("accessToken"))) CheckHash(payload.GetValueOrDefault("at_hash"), Convert.ToString(checks["accessToken"])!, alg, "at_hash");
-        if (Config.Truthy(checks.GetValueOrDefault("code"))) CheckHash(payload.GetValueOrDefault("c_hash"), Convert.ToString(checks["code"])!, alg, "c_hash");
+        if (Config.Truthy(checks.GetValueOrDefault("accessToken"))) CheckHash(payload.GetValueOrDefault("at_hash"), Convert.ToString(checks["accessToken"])!, alg, "at_hash", strict);
+        if (Config.Truthy(checks.GetValueOrDefault("code"))) CheckHash(payload.GetValueOrDefault("c_hash"), Convert.ToString(checks["code"])!, alg, "c_hash", false);
         if (checks.ContainsKey("maxAge") && checks.GetValueOrDefault("maxAge") != null)
         {
             if (Number(payload.GetValueOrDefault("auth_time")) is not double authTime)
@@ -149,8 +158,9 @@ public static class IdToken
         return output;
     }
 
-    static void CheckHash(object? claim, string value, string alg, string name)
+    static void CheckHash(object? claim, string value, string alg, string name, bool required)
     {
+        if (claim == null && required) throw new OidcError("validation", "the ID token has no " + name + ", and the token response carried an access token");
         if (claim == null) return;
         if (claim is not string text || !Same(text, HashClaim(value, alg)))
         {
