@@ -10,7 +10,7 @@
 # A build before the install script has run (CI, a fresh clone) has no chain file and still succeeds:
 # the same directory COPY simply finds none. Rebuild after running the install script against another
 # iya-sts.
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS test
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS test
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 ENV DOTNET_NOLOGO=1
 RUN apt-get update && apt-get install -y --no-install-recommends python3 openssl && rm -rf /var/lib/apt/lists/*
@@ -19,7 +19,7 @@ COPY . .
 RUN dotnet test --nologo && python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
 # The compile step sees only the sources, so a new trust chain or demo/oidc.json rebuilds no binary.
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 ENV DOTNET_NOLOGO=1
 WORKDIR /src
