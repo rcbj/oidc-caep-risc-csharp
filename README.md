@@ -19,9 +19,37 @@ var request = rp.Authorize();
 var who = rp.Complete(query, request);
 ```
 
-Tokens stay in this process. Keep the transaction until the browser returns.
+Tokens stay in this process. Keep the transaction until the browser returns. The transaction also carries the requested `AcrValues`.
 
 `tlsCa` names the iya-sts TLS listener CA trust chain for every back-channel request. A certificate the platform already trusts, or one that chains to `tlsCa`, is accepted only when it names the host in the URL: a DNS name must match a DNS SAN and an IP literal such as `127.0.0.1` an IP address SAN. A certificate that chains to `tlsCa` but names another host is refused.
+
+## Client profile settings
+
+These defaults apply whether the configuration is read from a file (`RelyingParty.FromFile`, `Config.ResolveConfig`) or built in code and given to `RelyingParty.Create` (`Config.ApplyDefaults` is the one place they are set).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `par` | `auto` | `auto` pushes the authorization request when the provider has a PAR endpoint, `always` requires one (creation fails without it), `never` does not push. When discovery says `require_pushed_authorization_requests: true`, `never` fails at creation and `auto` always pushes. |
+| `dpop` | `auto` | DPoP (RFC 9449). `auto` uses it when the provider's `dpop_signing_alg_values_supported` lists ES256; `always` fails at creation otherwise; `never` sends no proofs. |
+| `dpopKey` | none | A PEM P-256 private key (inline, `file:`, `env:`, or a path) for the DPoP proofs, for an application that runs several processes. Without it the key pair is generated when the relying party is created and held in memory only. |
+| `idTokenSigningAlgs` | `["RS256"]` | The ID token algorithms accepted, intersected with the provider's `id_token_signing_alg_values_supported`; creation fails when the intersection is empty. `none` is never accepted. A symmetric algorithm (HS256, HS384, HS512) is accepted only when named here. |
+| `idTokenSignedResponseAlg` | none | Pins one algorithm; the provider must advertise it. |
+| `requireIdTokenTypAndAtHash` | `true` | The ID token header must carry `typ` `JWT` or `application/jwt`, and when the token response carries an access token the ID token must carry a matching `at_hash`. `false` checks each only when present. |
+| `acrValues` | none | `acr_values` (a string or a list) sent on every authorization request; `AuthorizeOptions.AcrValues` overrides it per request. When `acr_values` was sent, the code exchange's ID token must carry an `acr` that is one of them. The refresh path does not re-check `acr`. |
+| `clockToleranceSec` | 30 | Clock skew for `exp`, `nbf`, `iat`, and `auth_time`. An `iat` more than this in the future is refused. |
+| `maxIdTokenAgeSec` | 600 | The oldest `iat` accepted. |
+
+`redirectUri`, `postLogoutRedirectUri`, and a per-request `AuthorizeOptions.RedirectUri` must be https, or http on a loopback host (`localhost`, `127.0.0.1`, `[::1]`). `allowInsecure` does not relax this; it only lets the provider's own endpoints use http.
+
+### DPoP
+
+When DPoP is in use, a proof (`typ` `dpop+jwt`, the public `jwk`, `jti`, `htm`, `htu` without query or fragment, `iat`) goes on every PAR request and every token request (code, refresh, client credentials), and `dpop_jkt` (the key's RFC 7638 thumbprint) goes on the authorization request (in the PAR body when PAR is used). The token response's `token_type` must then be `DPoP`; without a proof it must be `Bearer`. A 400 `use_dpop_nonce` from the authorization server, or a 401 with `WWW-Authenticate: DPoP error="use_dpop_nonce"` from a resource server, is retried once with the nonce the response gave, and the latest nonce per origin is sent on the next proof.
+
+`rp.ResourceRequest(method, url, headers, body, accessToken)` calls a resource server with the token: `Authorization: DPoP` and a proof carrying `ath` when DPoP is in use, `Authorization: Bearer` otherwise. `rp.UserInfo` uses it. `SignalsReceiver.New(...).WithRelyingParty(rp)` calls the SSF transmitter with the relying party's client-credentials token for `ssf.manage` through the same path, so every transmitter call carries a proof when the token is DPoP-bound. `rp.UsesDpop` and `rp.DpopSigner` say whether and with which key.
+
+### Session token cache
+
+`rp.Complete(query, request, sessionId)` keeps the sign-in's tokens in `rp.SessionStore` under `sessionId`, or under a new handle when none is given (`login.SessionId` either way). `rp.SessionAccessToken(sessionId)` returns a valid access token: the cached one while it has more than 30 seconds left, otherwise one obtained with the refresh token (with a DPoP proof when DPoP is in use), and the cache is updated. An unknown session, an expired one with no refresh token, or a failed refresh removes the entry and throws `OidcError` with code `session`. `rp.RemoveSession(sessionId)` clears an entry; a receiver built `WithRelyingParty(rp)` also clears the entries of sessions it ends (a CAEP `session-revoked`) and of `Untrack`. The default store is `MemorySessionTokenStore`; set `rp.SessionStore` to an `ISessionTokenStore` of your own for a store shared across processes.
 
 ## The iya-sts trust chain (`tlsCa`)
 
@@ -62,7 +90,7 @@ The tests build an in-process stub provider and a stub transmitter. They do not 
 docker compose up --build
 ```
 
-`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` starts `Authorize` and redirects. `GET /callback` completes the code exchange. `POST /logout` signs the local session out. `GET /live-status` is JSON for the sign-in and the Shared Signals events this process has accepted. It does not include tokens.
+`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` starts `Authorize` and redirects. `GET /callback` completes the code exchange. `POST /logout` signs the local session out. `GET /live-status` is JSON for the sign-in and the Shared Signals events this process has accepted. It does not include tokens. The demo passes its local session id to `Complete`, reads the access token with `SessionAccessToken` (and calls UserInfo with it) on `GET /`, removes it on sign-out, and builds the receiver `WithRelyingParty`. The install script registers the client with `id_token_signed_response_alg` RS256 (`oauthIdTokenSignedResponseAlg`).
 
 `docker-compose.yml` sets `network_mode: host`. The image sets `ENV PORT=3000`. The health check calls `http://127.0.0.1:${PORT}/healthz`. The running container's `PORT` wins over the shell's when `scripts/configure_iya_sts.py` registers the application.
 
