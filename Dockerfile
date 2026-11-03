@@ -29,7 +29,7 @@ RUN dotnet publish demo/OidcCaepRisc.Demo.csproj -c Release -o /out --nologo -p:
 
 # The runtime without the demo: python3 and openssl for the scripts (trust_chain.py reads certificate
 # names with openssl).
-FROM mcr.microsoft.com/dotnet/runtime:8.0 AS tools
+FROM mcr.microsoft.com/dotnet/runtime:10.0 AS tools
 RUN apt-get update && apt-get install -y --no-install-recommends python3 openssl curl ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY scripts scripts
