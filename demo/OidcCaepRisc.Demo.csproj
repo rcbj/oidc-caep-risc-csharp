@@ -3,12 +3,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>IyaSec.Oidc</RootNamespace>
     <AssemblyName>oidc-caep-risc-demo</AssemblyName>
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\src\IyaSec.OidcCaepRisc\IyaSec.OidcCaepRisc.csproj" />
